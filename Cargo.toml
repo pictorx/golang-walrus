@@ -1,0 +1,14 @@
+[package]
+name = "walrus_app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"] # Essential for building .so / .dll / .dylib
+
+[dependencies]
+fastcrypto = { git = "https://github.com/mystenlabs/fastcrypto.git", rev = "f519333aefa238384f813af74bbb58c68cc38ee7", features = ["wasm"]}
+walrus-core = { git = "https://github.com/mystenlabs/walrus.git", branch = "main", package = "walrus-core" }
+bcs = "0.1"
+libc = "0.2"
+reed-solomon-simd = "3.0.1"
