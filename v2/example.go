@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"os"
 
+	"github.com/block-vision/sui-go-sdk/models"
+	"github.com/block-vision/sui-go-sdk/signer"
+	"github.com/block-vision/sui-go-sdk/sui"
+	"github.com/block-vision/sui-go-sdk/transaction"
+	"github.com/block-vision/sui-go-sdk/utils"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -319,8 +324,6 @@ type EncodeResult struct {
 	PrimaryShards   [][]byte
 	SecondaryShards [][]byte
 	Metadata        []byte // The full serialized metadata
-	RootHash        []byte // The raw 32-byte root hash
-	BlobID          string // The Walrus-standard string representation
 }
 
 // GetMetadataSize calculates the exact buffer size needed for metadata
@@ -496,22 +499,7 @@ func (w *WalrusWASM) Encode(handle int32, data []byte, nShards int) (*EncodeResu
 	if err != nil {
 		return nil, err
 	}
-
-	// 1. Extract Root Hash (the last 32 bytes)
-	rootHash := make([]byte, 32)
-	copy(rootHash, metaBytes[len(metaBytes)-32:])
-	result.RootHash = rootHash
-
-	// 2. Extract Metadata (everything before the root hash)
-	metadataOnly := make([]byte, len(metaBytes)-32)
-	copy(metadataOnly, metaBytes[:len(metaBytes)-32])
-	result.Metadata = metadataOnly
-
-	// 3. Generate Blob ID
-	// Walrus typically uses a specific Base64 encoding (URL-safe, no padding)
-	// or Hex for the Blob ID.
-	blobID := base64.RawURLEncoding.EncodeToString(rootHash)
-	result.BlobID = blobID
+	result.Metadata = metaBytes
 
 	return result, nil
 }
@@ -554,7 +542,7 @@ func main() {
 
 	// 2. Prepare Data
 	data := []byte("Hello, Walrus! This is a test of the encoding system.")
-
+	fmt.Printf("My data: %d\n", len(data))
 	// 3. Encode
 	fmt.Println("Encoding data...")
 	result, err := wasm.Encode(encoderHandle, data, nShards)
@@ -572,8 +560,19 @@ func main() {
 		fmt.Printf("Shard 0 size: %d bytes\n", len(result.PrimaryShards[0]))
 	}
 
-	fmt.Println(result.BlobID)
-	// fmt.Println(result.RootHash)
+	blobId, rootHash, unencodedLen, encodingType, err := ExtractBlobInfo(result.Metadata)
+	if err != nil {
+		fmt.Printf("❌ QuickExtract failed: %v\n", err)
+	} else {
+		fmt.Printf("✅ Success!\n")
+		fmt.Printf("BlobId:          %s\n", hex.EncodeToString(blobId))
+		fmt.Printf("RootHash:        %s\n", hex.EncodeToString(rootHash))
+		fmt.Printf("Original Size:   %d bytes\n", unencodedLen)
+		fmt.Printf("Encoding Type:   %d bytes\n", encodingType)
+
+	}
+
+	//fmt.Println(result)
 
 	// Example: BLS12381 verification (you would need real signature/key data)
 	// signature := []byte{ /* ... */ }
@@ -585,4 +584,256 @@ func main() {
 	//     panic(err)
 	// }
 	// fmt.Printf("Signature valid: %v\n", valid)
+}
+
+const WAL_SYSTEM_ADDRESS_TESTNET string = "0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af"
+const WAL_SYSTEM_ADDRESS_MAINNET string = "0x2134d52768ea07e8c43570ef975eb3e4c27a39fa6396bef985b5abc58d03ddd2"
+const WALRUS_TESTNET_COIN = "0x8270feb7375eee355e64fdb69c50abb6b5f9393a722883c1cf45f8e26048810a::wal::WAL"
+const SUI_COIN = "0x2::sui::SUI"
+
+func shareObjectRef(address string, initial_shared_version uint64, mutable bool) (*transaction.SharedObjectRef, error) {
+	addressbyte, err := transaction.ConvertSuiAddressStringToBytes(
+		models.SuiAddress(address),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &transaction.SharedObjectRef{
+		ObjectId:             *addressbyte,
+		InitialSharedVersion: initial_shared_version,
+		Mutable:              mutable,
+	}, nil
+}
+
+func WalrusSystemTestnet() (*transaction.SharedObjectRef, error) {
+	walSystemObj, err := shareObjectRef(
+		WAL_SYSTEM_ADDRESS_TESTNET,
+		uint64(400185623),
+		true,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return walSystemObj, nil
+
+}
+
+var WAL_SYSTEM_PACKAGE_TESTNET models.MoveModule = models.MoveModule{
+	Package: "0xa998b8719ca1c0a6dc4e24a859bbb39f5477417f71885fbf2967a6510f699144",
+	Module:  "system",
+}
+
+func balances(tx *transaction.Transaction, address signer.Signer, ctx context.Context) (models.CoinAllBalanceResponse, error) {
+	balances, err := tx.SuiClient.SuiXGetAllBalance(ctx, models.SuiXGetAllBalanceRequest{
+		Owner: address.Address,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(balances) == 0 {
+		return nil, fmt.Errorf("zero balance in sui account")
+	}
+
+	return balances, nil
+}
+
+func coin_balance(balances models.CoinAllBalanceResponse, coin_type string) models.CoinBalanceResponse {
+	coinBal := models.CoinBalanceResponse{}
+
+	for _, coin := range balances {
+		if coin.CoinType == coin_type {
+			coinBal = coin
+		}
+	}
+
+	return coinBal
+}
+
+func get_coins(tx *transaction.Transaction, balances models.CoinAllBalanceResponse, coin_type string, address signer.Signer, ctx context.Context) (*models.PaginatedCoinsResponse, error) {
+	coin := coin_balance(
+		balances,
+		coin_type,
+	)
+
+	if coin.CoinType == "" {
+		return nil, fmt.Errorf("account does not have %s", coin_type)
+	}
+
+	coins, err := tx.SuiClient.SuiXGetCoins(ctx, models.SuiXGetCoinsRequest{
+		Owner:    address.Address,
+		CoinType: coin.CoinType,
+		Limit:    coin.CoinObjectCount,
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &coins, nil
+}
+
+func walrusCoinObjRef(coin_data models.CoinData) (*transaction.SuiObjectRef, error) {
+	walrusCoin := coin_data
+	walrusCoinObj, err := transaction.NewSuiObjectRef(
+		models.SuiAddress(walrusCoin.CoinObjectId),
+		walrusCoin.Version,
+		models.ObjectDigest(walrusCoin.Digest),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &transaction.SuiObjectRef{
+		ObjectId: walrusCoinObj.ObjectId,
+		Version:  walrusCoinObj.Version,
+		Digest:   walrusCoinObj.Digest,
+	}, nil
+}
+
+func reserve_space(tx *transaction.Transaction, wal_system_obj transaction.SharedObjectRef, wal_coin_obj_ref transaction.SuiObjectRef) (*transaction.Argument, error) {
+	walSystemObj := wal_system_obj
+	walCoinObjRef := wal_coin_obj_ref
+
+	reserve := tx.MoveCall(
+		models.SuiAddress(WAL_SYSTEM_PACKAGE_TESTNET.Package),
+		WAL_SYSTEM_PACKAGE_TESTNET.Module,
+		"reserve_space",
+		[]transaction.TypeTag{},
+		[]transaction.Argument{
+			tx.Data.V1.AddInput(
+				transaction.CallArg{
+					Object: &transaction.ObjectArg{
+						SharedObject: &walSystemObj,
+					},
+				},
+			),
+			tx.Pure(uint64(1)),
+			tx.Pure(uint32(1)),
+			tx.Data.V1.AddInput(
+				transaction.CallArg{
+					Object: &transaction.ObjectArg{
+						ImmOrOwnedObject: &walCoinObjRef,
+					},
+				},
+			),
+		},
+	)
+	return &reserve, nil
+}
+
+func gas_coin(coin models.CoinData) (*transaction.SuiObjectRef, error) {
+	gasCoinObj := coin
+
+	gasCoin, err := transaction.NewSuiObjectRef(
+		models.SuiAddress(gasCoinObj.CoinObjectId),
+		gasCoinObj.Version,
+		models.ObjectDigest(gasCoinObj.Digest),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return gasCoin, nil
+}
+
+func buy_storage(client sui.ISuiAPI, walrus_coin string, address signer.Signer, ctx context.Context) {
+	tx := transaction.NewTransaction()
+
+	tx.SetSuiClient(client.(*sui.Client)).
+		SetSigner(&address).
+		SetSender(models.SuiAddress(address.Address)).
+		SetGasBudget(20000000)
+
+	balances, err := balances(tx, address, ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	walrus_coins, err := get_coins(
+		tx,
+		balances,
+		walrus_coin,
+		address,
+		ctx,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	sui_coins, err := get_coins(
+		tx,
+		balances,
+		SUI_COIN,
+		address,
+		ctx,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	gasCoin, err := gas_coin(sui_coins.Data[0])
+	if err != nil {
+		panic(err)
+	}
+
+	tx.SetGasPayment([]transaction.SuiObjectRef{*gasCoin})
+
+	walSystemObj, err := WalrusSystemTestnet()
+	if err != nil {
+		panic(err)
+	}
+
+	walCoinObjRef, err := walrusCoinObjRef(walrus_coins.Data[0])
+	if err != nil {
+		panic(err)
+	}
+
+	reserve, err := reserve_space(tx, *walSystemObj, *walCoinObjRef)
+
+	if err != nil {
+		panic(err)
+	}
+
+	tx.TransferObjects([]transaction.Argument{*reserve}, tx.Pure(address.Address))
+
+	resp, err := tx.Execute(
+		ctx,
+		models.SuiTransactionBlockOptions{
+			ShowInput:    false,
+			ShowRawInput: false,
+			ShowEffects:  true,
+			ShowEvents:   false,
+		},
+		"WaitForLocalExecution",
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
+	utils.PrettyPrint(resp)
+
+}
+
+func wal_system_address(client sui.ISuiAPI, address string, ctx context.Context) error {
+	resp, err := client.SuiGetObject(ctx, models.SuiGetObjectRequest{
+		ObjectId: address,
+		Options: models.SuiObjectDataOptions{
+			ShowType:    true,
+			ShowContent: true,
+		},
+	})
+
+	if err != nil {
+		return nil
+	}
+
+	fmt.Println(resp.Data.Content)
+
+	return nil
 }
