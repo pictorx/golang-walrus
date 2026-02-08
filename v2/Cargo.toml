@@ -1,0 +1,21 @@
+[package]
+name = "walrus-wasm-wazero"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fastcrypto = { git = "https://github.com/mystenlabs/fastcrypto.git", rev = "f519333aefa238384f813af74bbb58c68cc38ee7", features = ["wasm"]}
+walrus-core = { git = "https://github.com/mystenlabs/walrus.git", branch = "main", package = "walrus-core" }
+bcs = "0.1"
+bincode = "1.3"
+reed-solomon-simd = "3.0.1"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Reduce code generation units for better optimization
+strip = true        # Strip symbols from binary
+panic = "abort"     # Reduce binary size by removing panic infrastructure
