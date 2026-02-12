@@ -1,4 +1,4 @@
-package main
+package v2
 
 import (
 	"context"
@@ -6,19 +6,15 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"os"
-	"time"
 
 	"github.com/block-vision/sui-go-sdk/signer"
+	gosuisdk "github.com/pictorx/go-sui-sdk"
 	pb "github.com/pictorx/go-sui-sdk/sui_rpc_proto/generated"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-
-	gosuisdk "github.com/pictorx/go-sui-sdk"
 )
 
 // Error codes matching Rust implementation
@@ -33,7 +29,75 @@ const (
 	ERROR_BUFFER_SIZE_MISMATCH   = -7
 	ERROR_INVALID_SHARDS         = -8
 	ERROR_DECODING_FAILED        = -9
+	// RPC Endpoint
+	RPC_ENDPOINT = "fullnode.testnet.sui.io:443"
+
+	// Walrus Protocol Config (Testnet)
+	WAL_PKG_ID          = "0xa998b8719ca1c0a6dc4e24a859bbb39f5477417f71885fbf2967a6510f699144"
+	WAL_SYSTEM_OBJ_ID   = "0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af"
+	WAL_SYSTEM_VERSION  = 400185623 // Initial shared version
+	WALRUS_TESTNET_COIN = "0x8270feb7375eee355e64fdb69c50abb6b5f9393a722883c1cf45f8e26048810a::wal::WAL"
+	SUI_COIN_TYPE       = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI"
 )
+
+// BlobId is 32 bytes
+type BlobId [32]byte
+
+// EncodingType enum
+type EncodingType uint32
+
+const (
+	RedStuff EncodingType = 0
+	RS2      EncodingType = 1
+)
+
+func ExtractBlobInfo(data []byte) (blobId []byte, rootHash []byte, unencodedLength uint32, encodingType uint32, err error) {
+	minSize := 32 + 4 + 4 + 4 + 4 + 8 + 32
+	if len(data) < minSize {
+		return nil, nil, 0, 0, fmt.Errorf("metadata too small: %d bytes (need at least %d)", len(data), minSize)
+	}
+
+	// BlobId is the first 32 bytes [0-31]
+	blobId = make([]byte, 32)
+	copy(blobId, data[0:32])
+
+	// EncodingType is at bytes 36-39 (u32)
+	encodingType = binary.LittleEndian.Uint32(data[36:40])
+
+	// Unencoded length is at bytes 40-43 (u32, not u64!)
+	unencodedLength = binary.LittleEndian.Uint32(data[40:44])
+
+	// RootHash is the last 32 bytes
+	rootHash = make([]byte, 32)
+	copy(rootHash, data[len(data)-32:])
+
+	return blobId, rootHash, unencodedLength, encodingType, nil
+}
+
+// String representation helpers
+func (b BlobId) String() string {
+	return hex.EncodeToString(b[:])
+}
+
+func (b BlobId) Bytes() []byte {
+	return b[:]
+}
+
+func (e EncodingType) String() string {
+	switch e {
+	case RedStuff:
+		return "RedStuff"
+	case RS2:
+		return "RS2"
+	default:
+		return fmt.Sprintf("Unknown(%d)", e)
+	}
+}
+
+// ToHex converts bytes to hex string
+func ToHex(b []byte) string {
+	return hex.EncodeToString(b)
+}
 
 type WalrusWASM struct {
 	ctx    context.Context
@@ -508,68 +572,6 @@ func (w *WalrusWASM) Encode(handle int32, data []byte, nShards int) (*EncodeResu
 	return result, nil
 }
 
-func main() {
-	ctx := context.Background()
-
-	// Create WASM instance
-	wasm, err := NewWalrusWASM(ctx, "./target/wasm32-wasip1/release/walrus_wasm_wazero.wasm")
-	if err != nil {
-		panic(err)
-	}
-	defer wasm.Close()
-
-	// ... inside main ...
-
-	// 1. Create Encoder (e.g., 10 shards)
-	// Note: Rust code uses RS2, so nShards usually implies specific breakdown (e.g., 2n)
-	nShards := 1000
-	encoderHandle, err := wasm.CreateEncoder(uint16(nShards))
-	if err != nil {
-		panic(err)
-	}
-	defer wasm.DestroyEncoder(encoderHandle)
-
-	data := []byte("Hello, Walrus! This is a test of the encoding system.")
-
-	result, err := wasm.Encode(encoderHandle, data, nShards)
-	if err != nil {
-		panic(fmt.Errorf("Encoding error: %v", err))
-	}
-
-	blobId, rootHash, unencodedLen, encodingType, err := ExtractBlobInfo(result.Metadata)
-	if err != nil {
-		fmt.Printf("❌ QuickExtract failed: %v\n", err)
-	} else {
-		fmt.Printf("✅ Success!\n")
-		fmt.Printf("BlobId:          %s\n", hex.EncodeToString(blobId))
-		fmt.Printf("RootHash:        %s\n", hex.EncodeToString(rootHash))
-		fmt.Printf("Original Size:   %d bytes\n", unencodedLen)
-		fmt.Printf("Encoding Type:   %d bytes\n", encodingType)
-
-	}
-
-	account, err := signer.NewSignerWithSecretKey("example_priv_key")
-	if err != nil {
-		panic(err)
-	}
-	exampleReserveSpace(account)
-
-}
-
-// ── CONSTANTS ─────────────────────────────────────────────────────────────────
-
-const (
-	// RPC Endpoint
-	RPC_ENDPOINT = "fullnode.testnet.sui.io:443"
-
-	// Walrus Protocol Config (Testnet)
-	WAL_PKG_ID          = "0xa998b8719ca1c0a6dc4e24a859bbb39f5477417f71885fbf2967a6510f699144"
-	WAL_SYSTEM_OBJ_ID   = "0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af"
-	WAL_SYSTEM_VERSION  = 400185623 // Initial shared version
-	WALRUS_TESTNET_COIN = "0x8270feb7375eee355e64fdb69c50abb6b5f9393a722883c1cf45f8e26048810a::wal::WAL"
-	SUI_COIN_TYPE       = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI"
-)
-
 type WalrusReserveSpace struct {
 	Gasbudget uint64
 	Gasprice  uint64
@@ -655,64 +657,6 @@ func (reserve *WalrusReserveSpace) ReserveSpace(conn *grpc.ClientConn, mod api.M
 	}
 	return resp, err
 
-}
-func exampleReserveSpace(acc *signer.Signer) {
-	// 1. Setup Context & Connection
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	conn, err := grpc.Dial(RPC_ENDPOINT, grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
-	if err != nil {
-		log.Fatalf("Failed to dial: %v", err)
-	}
-	defer conn.Close()
-
-	// 2. Setup WASM Runtime (Load your builder.wasm file)
-	wasmBytes, err := os.ReadFile("./go-sui-sdk/transaction/target/wasm32-wasip1/release/transaction_builder.wasm")
-	if err != nil {
-		log.Fatalf("Failed to read wasm file: %v", err)
-	}
-	r := wazero.NewRuntime(ctx)
-	defer r.Close(ctx)
-	wasi_snapshot_preview1.MustInstantiate(ctx, r)
-	mod, err := r.Instantiate(ctx, wasmBytes)
-	if err != nil {
-		log.Fatalf("Failed to instantiate WASM: %v", err)
-	}
-
-	// 3. Setup Signer
-	senderAddr := acc.Address
-	fmt.Printf("Sender: %s\n", senderAddr)
-
-	// 4. Find Required Coins (Gas & Payment)
-	fmt.Println("🔍 Finding coins...")
-	gasCoin, walCoin, err := FindCoins(ctx, conn, senderAddr)
-	if err != nil {
-		log.Fatalf("Coin discovery failed: %v", err)
-	}
-	fmt.Printf("   Gas Coin: %s (Ver: %d)\n", *gasCoin.ObjectId, *gasCoin.Version)
-	fmt.Printf("   WAL Coin: %s (Ver: %d)\n", *walCoin.ObjectId, *walCoin.Version)
-
-	gas, err := gosuisdk.GetGas(conn, ctx)
-	if err != nil {
-		panic(err)
-	}
-	gasPrice := gas.Epoch.ReferenceGasPrice
-
-	reserve := WalrusReserveSpace{
-		Gasbudget: 100_000_000,
-		Gasprice:  *gasPrice,
-		Amount:    1,
-		Epoch:     1,
-		GasCoin:   gasCoin,
-		WalCoin:   walCoin,
-	}
-
-	resp, err := reserve.ReserveSpace(conn, mod, acc, ctx)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(resp)
 }
 
 func FindCoins(ctx context.Context, conn *grpc.ClientConn, owner string) (gas *pb.Object, wal *pb.Object, err error) {
