@@ -2,19 +2,23 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
+	"time"
 
-	"github.com/block-vision/sui-go-sdk/models"
 	"github.com/block-vision/sui-go-sdk/signer"
-	"github.com/block-vision/sui-go-sdk/sui"
-	"github.com/block-vision/sui-go-sdk/transaction"
-	"github.com/block-vision/sui-go-sdk/utils"
+	pb "github.com/pictorx/go-sui-sdk/sui_rpc_proto/generated"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+
+	gosuisdk "github.com/pictorx/go-sui-sdk"
 )
 
 // Error codes matching Rust implementation
@@ -514,21 +518,6 @@ func main() {
 	}
 	defer wasm.Close()
 
-	fmt.Println("WASM module loaded successfully!")
-
-	// Example: Create encoder
-	/*encoder, err := wasm.CreateEncoder(1024)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("Encoder created with handle: %d\n", encoder)
-
-	// Clean up encoder
-	if err := wasm.DestroyEncoder(encoder); err != nil {
-		panic(err)
-	}
-	fmt.Println("Encoder destroyed successfully!")*/
-
 	// ... inside main ...
 
 	// 1. Create Encoder (e.g., 10 shards)
@@ -540,24 +529,11 @@ func main() {
 	}
 	defer wasm.DestroyEncoder(encoderHandle)
 
-	// 2. Prepare Data
 	data := []byte("Hello, Walrus! This is a test of the encoding system.")
-	fmt.Printf("My data: %d\n", len(data))
-	// 3. Encode
-	fmt.Println("Encoding data...")
+
 	result, err := wasm.Encode(encoderHandle, data, nShards)
 	if err != nil {
 		panic(fmt.Errorf("Encoding error: %v", err))
-	}
-
-	fmt.Printf("Encoding successful!\n")
-	fmt.Printf("Metadata size: %d bytes\n", len(result.Metadata))
-	fmt.Printf("Generated %d primary shards and %d secondary shards\n",
-		len(result.PrimaryShards), len(result.SecondaryShards))
-
-	// Print first shard content length to verify
-	if len(result.PrimaryShards) > 0 {
-		fmt.Printf("Shard 0 size: %d bytes\n", len(result.PrimaryShards[0]))
 	}
 
 	blobId, rootHash, unencodedLen, encodingType, err := ExtractBlobInfo(result.Metadata)
@@ -572,268 +548,212 @@ func main() {
 
 	}
 
-	//fmt.Println(result)
+	account, err := signer.NewSignerWithSecretKey("suiprivkey1qqqzjfp65wl44ve65a2cpf77006hl2wrrau702nf7huxzr99nxmq2uyepsl")
+	if err != nil {
+		panic(err)
+	}
+	exampleReserveSpace(account)
 
-	// Example: BLS12381 verification (you would need real signature/key data)
-	// signature := []byte{ /* ... */ }
-	// publicKey := []byte{ /* ... */ }
-	// message := []byte("Hello, World!")
-	//
-	// valid, err := wasm.VerifyBLS12381(signature, publicKey, message)
-	// if err != nil {
-	//     panic(err)
-	// }
-	// fmt.Printf("Signature valid: %v\n", valid)
 }
 
-const WAL_SYSTEM_ADDRESS_TESTNET string = "0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af"
-const WAL_SYSTEM_ADDRESS_MAINNET string = "0x2134d52768ea07e8c43570ef975eb3e4c27a39fa6396bef985b5abc58d03ddd2"
-const WALRUS_TESTNET_COIN = "0x8270feb7375eee355e64fdb69c50abb6b5f9393a722883c1cf45f8e26048810a::wal::WAL"
-const SUI_COIN = "0x2::sui::SUI"
+// ── CONSTANTS ─────────────────────────────────────────────────────────────────
 
-func shareObjectRef(address string, initial_shared_version uint64, mutable bool) (*transaction.SharedObjectRef, error) {
-	addressbyte, err := transaction.ConvertSuiAddressStringToBytes(
-		models.SuiAddress(address),
+const (
+	// RPC Endpoint
+	RPC_ENDPOINT = "fullnode.testnet.sui.io:443"
+
+	// Walrus Protocol Config (Testnet)
+	WAL_PKG_ID          = "0xa998b8719ca1c0a6dc4e24a859bbb39f5477417f71885fbf2967a6510f699144"
+	WAL_SYSTEM_OBJ_ID   = "0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af"
+	WAL_SYSTEM_VERSION  = 400185623 // Initial shared version
+	WALRUS_TESTNET_COIN = "0x8270feb7375eee355e64fdb69c50abb6b5f9393a722883c1cf45f8e26048810a::wal::WAL"
+	SUI_COIN_TYPE       = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI"
+)
+
+type WalrusReserveSpace struct {
+	Gasbudget uint64
+	Gasprice  uint64
+	Amount    uint64
+	GasCoin   *pb.Object
+	WalCoin   *pb.Object
+
+	Epoch uint32
+}
+
+func (reserve *WalrusReserveSpace) ReserveSpace(conn *grpc.ClientConn, mod api.Module, acc *signer.Signer, ctx context.Context) (*pb.ExecuteTransactionResponse, error) {
+	b := gosuisdk.NewBuilder(ctx, mod)
+	if err := b.SetConfig(acc.Address, reserve.Gasbudget, reserve.Gasprice); err != nil {
+		return nil, err
+	}
+
+	if err := b.AddGasObject(*reserve.GasCoin.ObjectId, uint64(*reserve.GasCoin.Version), *reserve.GasCoin.Digest); err != nil {
+		return nil, fmt.Errorf("add gas object: %w", err)
+	}
+
+	// A. Inputs
+	// Shared Object: Walrus System
+	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk.ObjectKindShared, true)
+	if err != nil {
+		return nil, fmt.Errorf("input system: %w", err)
+	}
+
+	// Owned Object: WAL Payment Coin
+	walArg, err := b.InputObject(*reserve.WalCoin.ObjectId, uint64(*reserve.WalCoin.Version), *reserve.WalCoin.Digest, gosuisdk.ObjectKindOwned, false)
+	if err != nil {
+		return nil, fmt.Errorf("input wal coin: %w", err)
+	}
+
+	// Pure Arguments
+	amtArg := b.PureU64(reserve.Amount) // Amount of storage
+	perArg := b.PureU32(reserve.Epoch)  // Periods (Note: u32)
+
+	// B. Move Call: system::reserve_space
+	resArg, err := b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"reserve_space",
+		[]string{}, // No type arguments
+		[]gosuisdk.MoveCallArg{
+			gosuisdk.ArgID(sysArg),
+			gosuisdk.ArgID(amtArg),
+			gosuisdk.ArgID(perArg),
+			gosuisdk.ArgID(walArg),
+		},
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("move call: %w", err)
 	}
 
-	return &transaction.SharedObjectRef{
-		ObjectId:             *addressbyte,
-		InitialSharedVersion: initial_shared_version,
-		Mutable:              mutable,
-	}, nil
-}
+	// C. Transfer Result (StorageGuard?) to Sender
+	recArg, err := b.PureAddress(acc.Address)
+	if err != nil {
+		return nil, err
+	}
+	b.TransferObjects([]uint64{resArg}, recArg)
 
-func WalrusSystemTestnet() (*transaction.SharedObjectRef, error) {
-	walSystemObj, err := shareObjectRef(
-		WAL_SYSTEM_ADDRESS_TESTNET,
-		uint64(400185623),
-		true,
-	)
-
+	TxBuildBytes, err := b.Build()
 	if err != nil {
 		return nil, err
 	}
 
-	return walSystemObj, nil
+	// Sign
+	signed, err := gosuisdk.SignTransaction(TxBuildBytes, acc)
+	if err != nil {
+		return nil, fmt.Errorf("signing: %w", err)
+	}
 
-}
-
-var WAL_SYSTEM_PACKAGE_TESTNET models.MoveModule = models.MoveModule{
-	Package: "0xa998b8719ca1c0a6dc4e24a859bbb39f5477417f71885fbf2967a6510f699144",
-	Module:  "system",
-}
-
-func balances(tx *transaction.Transaction, address signer.Signer, ctx context.Context) (models.CoinAllBalanceResponse, error) {
-	balances, err := tx.SuiClient.SuiXGetAllBalance(ctx, models.SuiXGetAllBalanceRequest{
-		Owner: address.Address,
-	})
+	// Decode Signature parts
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(balances) == 0 {
-		return nil, fmt.Errorf("zero balance in sui account")
+	// Execute
+	resp, err := gosuisdk.SignExecuteTransaction(conn, TxBuildBytes, sigRaw, ctx)
+	if err != nil {
+		return nil, err
+	}
+	return resp, err
+
+}
+func exampleReserveSpace(acc *signer.Signer) {
+	// 1. Setup Context & Connection
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	conn, err := grpc.Dial(RPC_ENDPOINT, grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
+	if err != nil {
+		log.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	// 2. Setup WASM Runtime (Load your builder.wasm file)
+	wasmBytes, err := os.ReadFile("./go-sui-sdk/transaction/target/wasm32-wasip1/release/transaction_builder.wasm")
+	if err != nil {
+		log.Fatalf("Failed to read wasm file: %v", err)
+	}
+	r := wazero.NewRuntime(ctx)
+	defer r.Close(ctx)
+	wasi_snapshot_preview1.MustInstantiate(ctx, r)
+	mod, err := r.Instantiate(ctx, wasmBytes)
+	if err != nil {
+		log.Fatalf("Failed to instantiate WASM: %v", err)
 	}
 
-	return balances, nil
+	// 3. Setup Signer
+	senderAddr := acc.Address
+	fmt.Printf("Sender: %s\n", senderAddr)
+
+	// 4. Find Required Coins (Gas & Payment)
+	fmt.Println("🔍 Finding coins...")
+	gasCoin, walCoin, err := FindCoins(ctx, conn, senderAddr)
+	if err != nil {
+		log.Fatalf("Coin discovery failed: %v", err)
+	}
+	fmt.Printf("   Gas Coin: %s (Ver: %d)\n", *gasCoin.ObjectId, *gasCoin.Version)
+	fmt.Printf("   WAL Coin: %s (Ver: %d)\n", *walCoin.ObjectId, *walCoin.Version)
+
+	gas, err := gosuisdk.GetGas(conn, ctx)
+	if err != nil {
+		panic(err)
+	}
+	gasPrice := gas.Epoch.ReferenceGasPrice
+
+	reserve := WalrusReserveSpace{
+		Gasbudget: 100_000_000,
+		Gasprice:  *gasPrice,
+		Amount:    1,
+		Epoch:     1,
+		GasCoin:   gasCoin,
+		WalCoin:   walCoin,
+	}
+
+	resp, err := reserve.ReserveSpace(conn, mod, acc, ctx)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(resp)
 }
 
-func coin_balance(balances models.CoinAllBalanceResponse, coin_type string) models.CoinBalanceResponse {
-	coinBal := models.CoinBalanceResponse{}
+func FindCoins(ctx context.Context, conn *grpc.ClientConn, owner string) (gas *pb.Object, wal *pb.Object, err error) {
+	// We iterate owned objects to find one SUI coin and one WAL coin
+	// In production, you'd want to merge coins if balances are too small.
+	resp, err := gosuisdk.ListOwnedObjects(conn, owner, nil, nil, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	gasCoin := gosuisdk.Coin{
+		Type: SUI_COIN_TYPE,
+	}
+	walCoin := gosuisdk.Coin{
+		Type: WALRUS_TESTNET_COIN,
+	}
 
-	for _, coin := range balances {
-		if coin.CoinType == coin_type {
-			coinBal = coin
+	for _, obj := range resp.Objects {
+		if gas == nil && *obj.ObjectType == gasCoin.String() {
+			gas = obj
+		}
+		if wal == nil && *obj.ObjectType == walCoin.String() {
+			wal = obj
+		}
+		if gas != nil && wal != nil {
+			break
 		}
 	}
 
-	return coinBal
-}
-
-func get_coins(tx *transaction.Transaction, balances models.CoinAllBalanceResponse, coin_type string, address signer.Signer, ctx context.Context) (*models.PaginatedCoinsResponse, error) {
-	coin := coin_balance(
-		balances,
-		coin_type,
-	)
-
-	if coin.CoinType == "" {
-		return nil, fmt.Errorf("account does not have %s", coin_type)
+	if gas == nil {
+		return nil, nil, fmt.Errorf("no SUI gas coin found")
 	}
-
-	coins, err := tx.SuiClient.SuiXGetCoins(ctx, models.SuiXGetCoinsRequest{
-		Owner:    address.Address,
-		CoinType: coin.CoinType,
-		Limit:    coin.CoinObjectCount,
-	})
-
+	if wal == nil {
+		return nil, nil, fmt.Errorf("no WAL coin found")
+	}
+	gas_coin, err := gosuisdk.GetObject(conn, *gas.ObjectId, gas.Version, ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	return &coins, nil
-}
-
-func walrusCoinObjRef(coin_data models.CoinData) (*transaction.SuiObjectRef, error) {
-	walrusCoin := coin_data
-	walrusCoinObj, err := transaction.NewSuiObjectRef(
-		models.SuiAddress(walrusCoin.CoinObjectId),
-		walrusCoin.Version,
-		models.ObjectDigest(walrusCoin.Digest),
-	)
-
+	wal_coin, err := gosuisdk.GetObject(conn, *wal.ObjectId, wal.Version, ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	return &transaction.SuiObjectRef{
-		ObjectId: walrusCoinObj.ObjectId,
-		Version:  walrusCoinObj.Version,
-		Digest:   walrusCoinObj.Digest,
-	}, nil
-}
-
-func reserve_space(tx *transaction.Transaction, wal_system_obj transaction.SharedObjectRef, wal_coin_obj_ref transaction.SuiObjectRef) (*transaction.Argument, error) {
-	walSystemObj := wal_system_obj
-	walCoinObjRef := wal_coin_obj_ref
-
-	reserve := tx.MoveCall(
-		models.SuiAddress(WAL_SYSTEM_PACKAGE_TESTNET.Package),
-		WAL_SYSTEM_PACKAGE_TESTNET.Module,
-		"reserve_space",
-		[]transaction.TypeTag{},
-		[]transaction.Argument{
-			tx.Data.V1.AddInput(
-				transaction.CallArg{
-					Object: &transaction.ObjectArg{
-						SharedObject: &walSystemObj,
-					},
-				},
-			),
-			tx.Pure(uint64(1)),
-			tx.Pure(uint32(1)),
-			tx.Data.V1.AddInput(
-				transaction.CallArg{
-					Object: &transaction.ObjectArg{
-						ImmOrOwnedObject: &walCoinObjRef,
-					},
-				},
-			),
-		},
-	)
-	return &reserve, nil
-}
-
-func gas_coin(coin models.CoinData) (*transaction.SuiObjectRef, error) {
-	gasCoinObj := coin
-
-	gasCoin, err := transaction.NewSuiObjectRef(
-		models.SuiAddress(gasCoinObj.CoinObjectId),
-		gasCoinObj.Version,
-		models.ObjectDigest(gasCoinObj.Digest),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return gasCoin, nil
-}
-
-func buy_storage(client sui.ISuiAPI, walrus_coin string, address signer.Signer, ctx context.Context) {
-	tx := transaction.NewTransaction()
-
-	tx.SetSuiClient(client.(*sui.Client)).
-		SetSigner(&address).
-		SetSender(models.SuiAddress(address.Address)).
-		SetGasBudget(20000000)
-
-	balances, err := balances(tx, address, ctx)
-	if err != nil {
-		panic(err)
-	}
-
-	walrus_coins, err := get_coins(
-		tx,
-		balances,
-		walrus_coin,
-		address,
-		ctx,
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	sui_coins, err := get_coins(
-		tx,
-		balances,
-		SUI_COIN,
-		address,
-		ctx,
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	gasCoin, err := gas_coin(sui_coins.Data[0])
-	if err != nil {
-		panic(err)
-	}
-
-	tx.SetGasPayment([]transaction.SuiObjectRef{*gasCoin})
-
-	walSystemObj, err := WalrusSystemTestnet()
-	if err != nil {
-		panic(err)
-	}
-
-	walCoinObjRef, err := walrusCoinObjRef(walrus_coins.Data[0])
-	if err != nil {
-		panic(err)
-	}
-
-	reserve, err := reserve_space(tx, *walSystemObj, *walCoinObjRef)
-
-	if err != nil {
-		panic(err)
-	}
-
-	tx.TransferObjects([]transaction.Argument{*reserve}, tx.Pure(address.Address))
-
-	resp, err := tx.Execute(
-		ctx,
-		models.SuiTransactionBlockOptions{
-			ShowInput:    false,
-			ShowRawInput: false,
-			ShowEffects:  true,
-			ShowEvents:   false,
-		},
-		"WaitForLocalExecution",
-	)
-
-	if err != nil {
-		panic(err)
-	}
-
-	utils.PrettyPrint(resp)
-
-}
-
-func wal_system_address(client sui.ISuiAPI, address string, ctx context.Context) error {
-	resp, err := client.SuiGetObject(ctx, models.SuiGetObjectRequest{
-		ObjectId: address,
-		Options: models.SuiObjectDataOptions{
-			ShowType:    true,
-			ShowContent: true,
-		},
-	})
-
-	if err != nil {
-		return nil
-	}
-
-	fmt.Println(resp.Data.Content)
-
-	return nil
+	return gas_coin.Object, wal_coin.Object, nil
 }
