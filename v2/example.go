@@ -548,7 +548,7 @@ func main() {
 
 	}
 
-	account, err := signer.NewSignerWithSecretKey("suiprivkey1qqqzjfp65wl44ve65a2cpf77006hl2wrrau702nf7huxzr99nxmq2uyepsl")
+	account, err := signer.NewSignerWithSecretKey("example_priv_key")
 	if err != nil {
 		panic(err)
 	}
