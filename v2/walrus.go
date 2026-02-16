@@ -1,12 +1,20 @@
 package v2
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/block-vision/sui-go-sdk/signer"
 	gosuisdk "github.com/pictorx/go-sui-sdk"
@@ -700,4 +708,494 @@ func FindCoins(ctx context.Context, conn *grpc.ClientConn, owner string) (gas *p
 		return nil, nil, err
 	}
 	return gas_coin.Object, wal_coin.Object, nil
+}
+
+type WalrusRegisterBlob struct {
+	Gasbudget uint64
+	Gasprice  uint64
+
+	// Reservation Params
+	Amount uint64 // Size in bytes
+	Epochs uint32 // Duration
+
+	// Registration Params
+	BlobId          [32]byte
+	RootHash        [32]byte
+	UnencodedLength uint64
+	EncodingType    uint8 // 0 for RedStuff, 1 for RS2
+	Deletable       bool
+
+	// Resources
+	GasCoin *pb.Object
+	WalCoin *pb.Object
+}
+
+// ReserveAndRegisterBlob executes the reservation and registration in a single PTB
+func (op *WalrusRegisterBlob) ReserveAndRegisterBlob(conn *grpc.ClientConn, mod api.Module, acc *signer.Signer, ctx context.Context) (*pb.ExecuteTransactionResponse, error) {
+	b := gosuisdk.NewBuilder(ctx, mod)
+
+	// 1. Configure Transaction
+	if err := b.SetConfig(acc.Address, op.Gasbudget, op.Gasprice); err != nil {
+		return nil, err
+	}
+	// Add Gas Payment
+	if err := b.AddGasObject(*op.GasCoin.ObjectId, uint64(*op.GasCoin.Version), *op.GasCoin.Digest); err != nil {
+		return nil, fmt.Errorf("add gas object: %w", err)
+	}
+
+	// 2. Prepare Inputs
+	// Shared Object: Walrus System
+	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk.ObjectKindShared, true)
+	if err != nil {
+		return nil, fmt.Errorf("input system: %w", err)
+	}
+
+	// Owned Object: WAL Coin for payment
+	// IMPORTANT: This will be used by BOTH reserve_space and register_blob
+	// The Move functions should take &mut Coin<WAL>, not Coin<WAL> by value
+	walArg, err := b.InputObject(*op.WalCoin.ObjectId, uint64(*op.WalCoin.Version), *op.WalCoin.Digest, gosuisdk.ObjectKindOwned, false)
+	if err != nil {
+		return nil, fmt.Errorf("input wal coin: %w", err)
+	}
+
+	// 3. Define Pure Arguments
+	// For reserve_space
+	amtArg := b.PureU64(op.Amount)
+	epochArg := b.PureU32(op.Epochs)
+
+	// For register_blob - must create separate args even if same value
+	// to ensure they're both added as transaction inputs
+	sizeArg := b.PureU64(op.UnencodedLength)
+	encArg := b.PureU8(op.EncodingType)
+	deletableArg := b.PureBool(op.Deletable)
+
+	// Blob Meta: Use PureRawBCS for byte arrays (u256 equivalent)
+	blobIdArg := b.PureRawBCS(op.BlobId[:])
+	rootHashArg := b.PureRawBCS(op.RootHash[:])
+
+	// 4. Command A: reserve_space
+	// Returns: Storage resource
+	storageArg, err := b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"reserve_space",
+		[]string{}, // No type args
+		[]gosuisdk.MoveCallArg{
+			gosuisdk.ArgID(sysArg),
+			gosuisdk.ArgID(amtArg),
+			gosuisdk.ArgID(epochArg),
+			gosuisdk.ArgID(walArg),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("reserve_space failed: %w", err)
+	}
+
+	// 5. Command B: register_blob
+	// Uses the storageArg from the previous command
+	// NOTE: Still needs WAL coin for metadata/registration costs (separate from storage)
+	blobObjArg, err := b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"register_blob",
+		[]string{},
+		[]gosuisdk.MoveCallArg{
+			gosuisdk.ArgID(sysArg),       // &mut System
+			gosuisdk.ArgID(storageArg),   // Storage (consumed from reserve_space)
+			gosuisdk.ArgID(blobIdArg),    // u256 blob_id
+			gosuisdk.ArgID(rootHashArg),  // u256 root_hash
+			gosuisdk.ArgID(sizeArg),      // u64 size
+			gosuisdk.ArgID(encArg),       // u8 encoding_type
+			gosuisdk.ArgID(deletableArg), // bool deletable
+			gosuisdk.ArgID(walArg),       // Coin<WAL> for metadata costs
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("register_blob failed: %w", err)
+	}
+
+	// 6. Command C: Transfer the new Blob Object to Sender
+	recArg, err := b.PureAddress(acc.Address)
+	if err != nil {
+		return nil, err
+	}
+	// Transfer the result of register_blob (blobObjArg)
+	if err := b.TransferObjects([]uint64{blobObjArg}, recArg); err != nil {
+		return nil, fmt.Errorf("transfer failed: %w", err)
+	}
+
+	// 7. Build, Sign, Execute
+	txBytes, err := b.Build()
+	if err != nil {
+		return nil, err
+	}
+
+	signed, err := gosuisdk.SignTransaction(txBytes, acc)
+	if err != nil {
+		return nil, fmt.Errorf("signing: %w", err)
+	}
+
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, err
+	}
+
+	// Using standard ExecuteTransaction (assuming signature scheme handling is in place)
+	return gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
+}
+
+/*type WalrusCertifyBlob struct {
+	Gasbudget uint64
+	Gasprice  uint64
+
+	// The Blob Object created in the previous step
+	BlobObjectId string
+	BlobVersion  uint64
+	BlobDigest   string
+
+	// The Aggregated BLS Signature (from storage nodes)
+	AggregatedSignature []byte
+
+	GasCoin *pb.Object
+}
+
+func (op *WalrusCertifyBlob) CertifyBlob(conn *grpc.ClientConn, mod api.Module, acc *signer.Signer, ctx context.Context) (*pb.ExecuteTransactionResponse, error) {
+	b := gosuisdk.NewBuilder(ctx, mod)
+
+	// 1. Configure
+	if err := b.SetConfig(acc.Address, op.Gasbudget, op.Gasprice); err != nil {
+		return nil, err
+	}
+	if err := b.AddGasObject(*op.GasCoin.ObjectId, uint64(*op.GasCoin.Version), *op.GasCoin.Digest); err != nil {
+		return nil, fmt.Errorf("add gas object: %w", err)
+	}
+
+	// 2. Inputs
+	// Shared Object: System
+	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk.ObjectKindShared, true)
+	if err != nil {
+		return nil, fmt.Errorf("input system: %w", err)
+	}
+
+	// Shared Object: The Blob itself
+	// Note: After registration, the Blob might be Owned or Shared depending on logic.
+	// Typically in Walrus, the blob object becomes Shared after certification, but exists as an object
+	// that needs to be passed here. If you own it (transfer_objects in step 1), use ObjectKindOwned.
+	// However, `certify_blob` usually essentially "initializes" it.
+	// Let's assume Owned based on the transfer in Step 1.
+	blobArg, err := b.InputObject(op.BlobObjectId, op.BlobVersion, op.BlobDigest, gosuisdk.ObjectKindOwned, false)
+	if err != nil {
+		return nil, fmt.Errorf("input blob object: %w", err)
+	}
+
+	// Pure Argument: The Aggregated Signature
+	sigArg := b.PureRawBCS(op.AggregatedSignature)
+
+	// 3. Command: certify_blob
+	_, err = b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"certify_blob",
+		[]string{},
+		[]gosuisdk.MoveCallArg{
+			gosuisdk.ArgID(sysArg),  // &mut System
+			gosuisdk.ArgID(blobArg), // &mut Blob
+			gosuisdk.ArgID(sigArg),  // vector<u8> signature
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("certify_blob failed: %w", err)
+	}
+
+	// 4. Execute
+	txBytes, err := b.Build()
+	if err != nil {
+		return nil, err
+	}
+
+	signed, err := gosuisdk.SignTransaction(txBytes, acc)
+	if err != nil {
+		return nil, fmt.Errorf("signing: %w", err)
+	}
+
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, err
+	}
+
+	return gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
+}*/
+
+// -----------------------------------------------------------------------------
+// Structs for API Request/Response
+// -----------------------------------------------------------------------------
+
+// TipConfigResponse represents the JSON response from /v1/tip-config.
+// It handles both "send_tip" and implicit "no_tip" scenarios.
+type TipConfigResponse struct {
+	// SendTip will be nil if the relay is free (returns "no_tip").
+	SendTip *TipRequirement `json:"send_tip,omitempty"`
+}
+
+type TipRequirement struct {
+	Address string  `json:"address"`
+	Kind    TipKind `json:"kind"`
+}
+
+// TipKind handles the "const" or "linear" tip structure.
+type TipKind struct {
+	Const  *uint64 `json:"const,omitempty"`
+	Linear *uint64 `json:"linear,omitempty"`
+}
+
+// UploadOptions contains the parameters required for the upload URL query string.
+type UploadOptions struct {
+	BlobID string // Required
+
+	// Required if the relay requires a tip (SendTip is not nil)
+	TxID  string // Base58 encoded transaction ID
+	Nonce string // Base64 URL-encoded string
+
+	// Optional parameters
+	DeletableBlobObject string // Hex string, only if blob is deletable
+	EncodingType        string // Defaults to "RS2" if empty
+}
+
+// UploadResponse represents the JSON response from /v1/blob-upload-relay.
+type UploadResponse struct {
+	BlobID                  json.RawMessage `json:"blob_id"` // Changed to RawMessage to handle any format
+	ConfirmationCertificate json.RawMessage `json:"confirmation_certificate"`
+}
+
+// -----------------------------------------------------------------------------
+// HTTP Client
+// -----------------------------------------------------------------------------
+
+type UploadRelayClient struct {
+	BaseURL    string
+	HTTPClient *http.Client
+}
+
+// NewClient creates a new Walrus Upload Relay client.
+// baseURL example: "https://upload-relay.testnet.walrus.space"
+func NewClient(baseURL string) *UploadRelayClient {
+	return &UploadRelayClient{
+		BaseURL: baseURL,
+		HTTPClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+// GetTipConfig fetches the tipping configuration from /v1/tip-config.
+// Docs: https://docs.wal.app/docs/operator-guide/upload-relay#operate-the-upload-relay
+func (c *UploadRelayClient) GetTipConfig(ctx context.Context) (*TipConfigResponse, error) {
+	endpoint := fmt.Sprintf("%s/v1/tip-config", c.BaseURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	var config TipConfigResponse
+	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &config, nil
+}
+
+// UploadBlob sends the blob data to /v1/blob-upload-relay.
+// Docs: https://docs.wal.app/docs/operator-guide/upload-relay#send-data-to-the-upload-relay
+func (c *UploadRelayClient) UploadBlob(ctx context.Context, blobData []byte, opts UploadOptions) (*UploadResponse, error) {
+	endpoint := fmt.Sprintf("%s/v1/blob-upload-relay", c.BaseURL)
+
+	// Build query string manually to avoid double-encoding base64 URL-safe strings
+	queryParts := []string{
+		"blob_id=" + opts.BlobID, // Already base64 URL-safe
+	}
+
+	if opts.TxID != "" {
+		queryParts = append(queryParts, "tx_id="+opts.TxID)
+	}
+	if opts.Nonce != "" {
+		// DON'T URL-encode - it's already base64 URL-safe!
+		queryParts = append(queryParts, "nonce="+opts.Nonce)
+	}
+	if opts.DeletableBlobObject != "" {
+		queryParts = append(queryParts, "deletable_blob_object="+opts.DeletableBlobObject)
+	}
+	if opts.EncodingType != "" {
+		queryParts = append(queryParts, "encoding_type="+opts.EncodingType)
+	}
+
+	fullURL := endpoint + "?" + strings.Join(queryParts, "&")
+
+	// Create request with manually constructed URL
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(blobData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	// Execute
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upload request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Handle Response
+	bodyBytes, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("upload failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var uploadResp UploadResponse
+	if err := json.Unmarshal(bodyBytes, &uploadResp); err != nil {
+		// Upload succeeded but we can't parse the response - still a success!
+		fmt.Printf("⚠️  Warning: Could not parse response JSON: %v\n", err)
+		fmt.Printf("But upload completed successfully (HTTP 200)!\n\n")
+		return nil, err
+	}
+
+	return &uploadResp, nil
+}
+
+/*
+// WalrusNonce holds both the API-ready string and the Tx-ready digest
+
+	type WalrusNonce struct {
+		// Value passed to the Relay API (base64url encoded)
+		String string
+
+		// Value used in the Sui Transaction (SHA256 hash of the raw bytes)
+		Digest []byte
+
+		// The raw random bytes (kept if needed for debugging)
+		Raw []byte
+	}
+
+// CreateWalrusNonce generates the random nonce and derives its formats
+
+	func CreateWalrusNonce() (*WalrusNonce, error) {
+		// 1. Generate 16 random bytes
+		raw := make([]byte, 16)
+		if _, err := rand.Read(raw); err != nil {
+			return nil, fmt.Errorf("failed to generate random bytes: %w", err)
+		}
+
+		// 2. Format for API: Base64 URL-encoded string WITHOUT padding
+		// Docs: "The nonce ... as a base64 URL-encoded string without padding."
+		nonceStr := base64.RawURLEncoding.EncodeToString(raw)
+
+		// 3. Format for Transaction: SHA256 Hash of the raw bytes
+		// Docs: "It generates a random nonce, and hashes it nonce_digest = SHA256(nonce)."
+		hasher := sha256.New()
+		hasher.Write(raw)
+		digest := hasher.Sum(nil)
+
+		return &WalrusNonce{
+			String: nonceStr,
+			Digest: digest,
+			Raw:    raw,
+		}, nil
+	}
+*/
+func PayRelayTip(
+	ctx context.Context,
+	conn *grpc.ClientConn,
+	mod api.Module,
+	acc *signer.Signer,
+	blobData []byte,
+	tipAmount uint64,
+	recipient string,
+	gasCoin *pb.Object,
+	gasPrice uint64,
+	gasBudget uint64,
+) (*pb.ExecuteTransactionResponse, string, error) {
+	// 1. Generate 32-byte nonce
+	nonceRaw := make([]byte, 32)
+	if _, err := rand.Read(nonceRaw); err != nil {
+		return nil, "", fmt.Errorf("failed to generate nonce: %w", err)
+	}
+
+	// THIS is what goes in the URL - the RAW preimage
+	nonceStr := base64.RawURLEncoding.EncodeToString(nonceRaw)
+
+	// 2. Construct Auth Message
+	// Hash the blob data
+	blobHash := sha256.Sum256(blobData)
+
+	// Hash the nonce for the auth package
+	nonceHash := sha256.Sum256(nonceRaw)
+
+	// Length as u64 little-endian (8 bytes)
+	lenBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(lenBytes, uint64(len(blobData)))
+
+	// Construct: blob_digest || nonce_digest || length
+	var authPayload []byte
+	authPayload = append(authPayload, blobHash[:]...)
+	authPayload = append(authPayload, nonceHash[:]...)
+	authPayload = append(authPayload, lenBytes...)
+
+	// BCS encode with length prefix
+	//bcsAuthInput := append([]byte{byte(len(authPayload))}, authPayload...)
+
+	// 3. Build Transaction
+	b := gosuisdk.NewBuilder(ctx, mod)
+	if err := b.SetConfig(acc.Address, gasBudget, gasPrice); err != nil {
+		return nil, "", err
+	}
+	if err := b.AddGasObject(*gasCoin.ObjectId, uint64(*gasCoin.Version), *gasCoin.Digest); err != nil {
+		return nil, "", err
+	}
+
+	// Input 0: Auth Message
+	//b.PureRawBCS(bcsAuthInput)
+	b.PureRawBCS(authPayload)
+
+	// Commands
+	gasArg := b.GasArgument()
+	amtArg := b.PureU64(tipAmount)
+	recArg, _ := b.PureAddress(recipient)
+
+	splitRes, err := b.SplitCoins(gasArg, []uint64{amtArg})
+	if err != nil {
+		return nil, "", err
+	}
+	tipCoin := b.NestedResult(splitRes, 0)
+	b.TransferObjects([]uint64{tipCoin}, recArg)
+
+	// 4. Sign & Execute
+	txBytes, err := b.Build()
+	if err != nil {
+		return nil, "", err
+	}
+
+	signed, err := gosuisdk.SignTransaction(txBytes, acc)
+	if err != nil {
+		return nil, "", err
+	}
+
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, "", err
+	}
+
+	resp, err := gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
+	return resp, nonceStr, err // Return the RAW nonce (preimage), not the hash!
 }
