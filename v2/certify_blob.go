@@ -3,7 +3,6 @@ package v2
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -14,126 +13,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-// ConfirmationCertificate represents the certificate returned from storage nodes
-type ConfirmationCertificate struct {
-	Signers           []byte `json:"signers"`
-	SerializedMessage []byte `json:"serialized_message"`
-	Signature         string `json:"signature"` // Base64 encoded
-}
-
-type WalrusCertifyBlob struct {
-	Gasbudget uint64
-	Gasprice  uint64
-
-	// The Blob Object created in registration
-	BlobObjectId string
-	BlobVersion  uint64
-	BlobDigest   string
-
-	// The confirmation certificate from storage nodes
-	Certificate *ConfirmationCertificate
-
-	GasCoin *pb.Object
-}
-
-func (op *WalrusCertifyBlob) CertifyBlob(
-	conn *grpc.ClientConn,
-	mod api.Module,
-	acc *signer.Signer,
-	ctx context.Context,
-) (*pb.ExecuteTransactionResponse, error) {
-	b := gosuisdk.NewBuilder(ctx, mod)
-
-	// 1. Configure
-	if err := b.SetConfig(acc.Address, op.Gasbudget, op.Gasprice); err != nil {
-		return nil, err
-	}
-	if err := b.AddGasObject(*op.GasCoin.ObjectId, uint64(*op.GasCoin.Version), *op.GasCoin.Digest); err != nil {
-		return nil, fmt.Errorf("add gas object: %w", err)
-	}
-
-	// 2. System object (shared, immutable for certify_blob)
-	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk.ObjectKindShared, true)
-	if err != nil {
-		return nil, fmt.Errorf("input system: %w", err)
-	}
-
-	// 3. Blob object (owned, mutable)
-	blobArg, err := b.InputObject(op.BlobObjectId, op.BlobVersion, op.BlobDigest, gosuisdk.ObjectKindOwned, true)
-	if err != nil {
-		return nil, fmt.Errorf("input blob object: %w", err)
-	}
-
-	// 4. Decode and prepare certificate arguments
-	// The signature is base64 encoded
-	signatureBytes, err := base64.StdEncoding.DecodeString(op.Certificate.Signature)
-	if err != nil {
-		return nil, fmt.Errorf("decode signature: %w", err)
-	}
-
-	// Create pure arguments for the certificate
-	// According to Walrus contract, certify_blob expects:
-	// - system: &System
-	// - blob: &mut Blob
-	// - signature: vector<u8> (BLS aggregate signature)
-	// - signers: vector<u8> (bitmap of signers) - already a bitmap!
-	// - message: vector<u8> (serialized message)
-
-	// BCS encode the signature as vector<u8>
-	sigArg := b.PureRawBCS(append([]byte{byte(len(signatureBytes))}, signatureBytes...))
-
-	// BCS encode the signers bitmap as vector<u8> (it's already a bitmap from the relay)
-	signersArg := b.PureRawBCS(append([]byte{byte(len(op.Certificate.Signers))}, op.Certificate.Signers...))
-
-	// BCS encode the serialized message as vector<u8>
-	messageArg := b.PureRawBCS(append([]byte{byte(len(op.Certificate.SerializedMessage))}, op.Certificate.SerializedMessage...))
-
-	// 5. Call certify_blob
-	_, err = b.MoveCall(
-		WAL_PKG_ID,
-		"system",
-		"certify_blob",
-		[]string{},
-		[]gosuisdk.MoveCallArg{
-			gosuisdk.ArgID(sysArg),     // &System (immutable)
-			gosuisdk.ArgID(blobArg),    // &mut Blob
-			gosuisdk.ArgID(sigArg),     // vector<u8> signature
-			gosuisdk.ArgID(signersArg), // vector<u8> signers bitmap
-			gosuisdk.ArgID(messageArg), // vector<u8> serialized message
-		},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("certify_blob move call failed: %w", err)
-	}
-
-	// 6. Build, sign, and execute
-	txBytes, err := b.Build()
-	if err != nil {
-		return nil, fmt.Errorf("build transaction: %w", err)
-	}
-
-	signed, err := gosuisdk.SignTransaction(txBytes, acc)
-	if err != nil {
-		return nil, fmt.Errorf("sign transaction: %w", err)
-	}
-
-	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
-	if err != nil {
-		return nil, fmt.Errorf("decode signature: %w", err)
-	}
-
-	return gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
-}
-
-// Helper function to parse the certificate from upload response
-func ParseCertificate(certBytes []byte) (*ConfirmationCertificate, error) {
-	var cert ConfirmationCertificate
-	if err := json.Unmarshal(certBytes, &cert); err != nil {
-		return nil, fmt.Errorf("parse certificate: %w", err)
-	}
-	return &cert, nil
-}
-
 // CompleteWalrusFlow performs register -> upload -> certify in one rapid sequence
 func CompleteWalrusFlow(
 	ctx context.Context,
@@ -142,7 +21,7 @@ func CompleteWalrusFlow(
 	acc *signer.Signer,
 	client *UploadRelayClient,
 	blobData []byte,
-	nShards int,
+	cfg *CommitteeConfig,
 	wasm *WalrusWASM,
 ) error {
 	startTime := time.Now()
@@ -152,23 +31,21 @@ func CompleteWalrusFlow(
 	if err != nil {
 		return fmt.Errorf("get gas: %w", err)
 	}
-	startEpoch := *gas0.Epoch.Epoch
 	gasPrice := gas0.Epoch.ReferenceGasPrice
 
-	fmt.Printf("\n🚀 Starting Walrus flow in epoch %d\n", startEpoch)
 	fmt.Printf("   Timestamp: %s\n\n", startTime.Format(time.RFC3339))
 
 	// ===================================================================
 	// STEP 1: ENCODE BLOB
 	// ===================================================================
 	fmt.Println("📝 Step 1: Encoding blob...")
-	encoderHandle, err := wasm.CreateEncoder(uint16(nShards))
+	encoderHandle, err := wasm.CreateEncoder(uint16(cfg.NShards))
 	if err != nil {
 		return fmt.Errorf("create encoder: %w", err)
 	}
 	defer wasm.DestroyEncoder(encoderHandle)
 
-	result, err := wasm.Encode(encoderHandle, blobData, nShards)
+	result, err := wasm.Encode(encoderHandle, blobData, cfg.NShards)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
@@ -285,37 +162,6 @@ func CompleteWalrusFlow(
 		fmt.Println("   ✓ No tip required")
 	}
 
-	// ===================================================================
-	// STEP 5: UPLOAD TO STORAGE NODES
-	// ===================================================================
-	/*var size uint32 = 0
-	commitee, err := gosuisdk.ListDynamicFields(
-		conn,
-		WAL_SYSTEM_OBJ_ID,
-		&size,
-		nil,
-		ctx,
-	)
-	if err != nil {
-		return fmt.Errorf("%w", err)
-	}
-	field := commitee.DynamicFields[0].FieldId
-	comObj := pb.NewLedgerServiceClient(conn)
-	fieldObj, err := comObj.GetObject(ctx, &pb.GetObjectRequest{
-		ObjectId: field,
-		Version:  nil,
-		ReadMask: &fieldmaskpb.FieldMask{
-			Paths: []string{
-				"contents",
-			},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("%w", err)
-	}
-
-	fmt.Println(fieldObj.Object.Contents.String())*/
-
 	fmt.Println("☁️  Step 5: Uploading to storage nodes...")
 
 	opts := UploadOptions{
@@ -377,6 +223,7 @@ func CompleteWalrusFlow(
 		BlobDigest:   *latestBlobObj.Object.Digest,
 		Certificate:  cert,
 		GasCoin:      certGasCoin.Object,
+		Config:       cfg,
 	}
 
 	certifyResp, err := certTx.CertifyBlob(conn, mod, acc, ctx)
@@ -391,20 +238,9 @@ func CompleteWalrusFlow(
 	fmt.Printf("   ✅ CERTIFIED!\n")
 	fmt.Printf("   TX: %s\n\n", *certifyResp.Transaction.Effects.TransactionDigest)
 
-	// Final epoch check
-	gas4, _ := gosuisdk.GetGas(conn, ctx)
-	finalEpoch := *gas4.Epoch.Epoch
-
 	elapsed := time.Since(startTime)
 	fmt.Printf("🎉 COMPLETE!\n")
 	fmt.Printf("   Total time: %v\n", elapsed)
-	fmt.Printf("   Start epoch: %d\n", startEpoch)
-	fmt.Printf("   End epoch: %d\n", finalEpoch)
-	if finalEpoch == startEpoch {
-		fmt.Printf("   ✅ Completed in same epoch!\n")
-	} else {
-		fmt.Printf("   ⚠️  Epoch changed during flow (but still succeeded)\n")
-	}
 
 	return nil
 }

@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
+	"github.com/block-vision/sui-go-sdk/constant"
+	"github.com/block-vision/sui-go-sdk/models"
 	"github.com/block-vision/sui-go-sdk/signer"
+	"github.com/block-vision/sui-go-sdk/sui"
 	gosuisdk "github.com/pictorx/go-sui-sdk"
 	pb "github.com/pictorx/go-sui-sdk/sui_rpc_proto/generated"
 	"github.com/tetratelabs/wazero"
@@ -844,88 +846,6 @@ func (op *WalrusRegisterBlob) ReserveAndRegisterBlob(conn *grpc.ClientConn, mod 
 	return gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
 }
 
-/*type WalrusCertifyBlob struct {
-	Gasbudget uint64
-	Gasprice  uint64
-
-	// The Blob Object created in the previous step
-	BlobObjectId string
-	BlobVersion  uint64
-	BlobDigest   string
-
-	// The Aggregated BLS Signature (from storage nodes)
-	AggregatedSignature []byte
-
-	GasCoin *pb.Object
-}
-
-func (op *WalrusCertifyBlob) CertifyBlob(conn *grpc.ClientConn, mod api.Module, acc *signer.Signer, ctx context.Context) (*pb.ExecuteTransactionResponse, error) {
-	b := gosuisdk.NewBuilder(ctx, mod)
-
-	// 1. Configure
-	if err := b.SetConfig(acc.Address, op.Gasbudget, op.Gasprice); err != nil {
-		return nil, err
-	}
-	if err := b.AddGasObject(*op.GasCoin.ObjectId, uint64(*op.GasCoin.Version), *op.GasCoin.Digest); err != nil {
-		return nil, fmt.Errorf("add gas object: %w", err)
-	}
-
-	// 2. Inputs
-	// Shared Object: System
-	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk.ObjectKindShared, true)
-	if err != nil {
-		return nil, fmt.Errorf("input system: %w", err)
-	}
-
-	// Shared Object: The Blob itself
-	// Note: After registration, the Blob might be Owned or Shared depending on logic.
-	// Typically in Walrus, the blob object becomes Shared after certification, but exists as an object
-	// that needs to be passed here. If you own it (transfer_objects in step 1), use ObjectKindOwned.
-	// However, `certify_blob` usually essentially "initializes" it.
-	// Let's assume Owned based on the transfer in Step 1.
-	blobArg, err := b.InputObject(op.BlobObjectId, op.BlobVersion, op.BlobDigest, gosuisdk.ObjectKindOwned, false)
-	if err != nil {
-		return nil, fmt.Errorf("input blob object: %w", err)
-	}
-
-	// Pure Argument: The Aggregated Signature
-	sigArg := b.PureRawBCS(op.AggregatedSignature)
-
-	// 3. Command: certify_blob
-	_, err = b.MoveCall(
-		WAL_PKG_ID,
-		"system",
-		"certify_blob",
-		[]string{},
-		[]gosuisdk.MoveCallArg{
-			gosuisdk.ArgID(sysArg),  // &mut System
-			gosuisdk.ArgID(blobArg), // &mut Blob
-			gosuisdk.ArgID(sigArg),  // vector<u8> signature
-		},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("certify_blob failed: %w", err)
-	}
-
-	// 4. Execute
-	txBytes, err := b.Build()
-	if err != nil {
-		return nil, err
-	}
-
-	signed, err := gosuisdk.SignTransaction(txBytes, acc)
-	if err != nil {
-		return nil, fmt.Errorf("signing: %w", err)
-	}
-
-	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
-	if err != nil {
-		return nil, err
-	}
-
-	return gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
-}*/
-
 // -----------------------------------------------------------------------------
 // Structs for API Request/Response
 // -----------------------------------------------------------------------------
@@ -980,9 +900,9 @@ type UploadRelayClient struct {
 // baseURL example: "https://upload-relay.testnet.walrus.space"
 func NewClient(baseURL string) *UploadRelayClient {
 	return &UploadRelayClient{
-		BaseURL: baseURL,
+		BaseURL:    baseURL,
 		HTTPClient: &http.Client{
-			Timeout: 30 * time.Second,
+			//Timeout: 30 * time.Second,
 		},
 	}
 }
@@ -1074,46 +994,6 @@ func (c *UploadRelayClient) UploadBlob(ctx context.Context, blobData []byte, opt
 	return &uploadResp, nil
 }
 
-/*
-// WalrusNonce holds both the API-ready string and the Tx-ready digest
-
-	type WalrusNonce struct {
-		// Value passed to the Relay API (base64url encoded)
-		String string
-
-		// Value used in the Sui Transaction (SHA256 hash of the raw bytes)
-		Digest []byte
-
-		// The raw random bytes (kept if needed for debugging)
-		Raw []byte
-	}
-
-// CreateWalrusNonce generates the random nonce and derives its formats
-
-	func CreateWalrusNonce() (*WalrusNonce, error) {
-		// 1. Generate 16 random bytes
-		raw := make([]byte, 16)
-		if _, err := rand.Read(raw); err != nil {
-			return nil, fmt.Errorf("failed to generate random bytes: %w", err)
-		}
-
-		// 2. Format for API: Base64 URL-encoded string WITHOUT padding
-		// Docs: "The nonce ... as a base64 URL-encoded string without padding."
-		nonceStr := base64.RawURLEncoding.EncodeToString(raw)
-
-		// 3. Format for Transaction: SHA256 Hash of the raw bytes
-		// Docs: "It generates a random nonce, and hashes it nonce_digest = SHA256(nonce)."
-		hasher := sha256.New()
-		hasher.Write(raw)
-		digest := hasher.Sum(nil)
-
-		return &WalrusNonce{
-			String: nonceStr,
-			Digest: digest,
-			Raw:    raw,
-		}, nil
-	}
-*/
 func PayRelayTip(
 	ctx context.Context,
 	conn *grpc.ClientConn,
@@ -1198,4 +1078,233 @@ func PayRelayTip(
 
 	resp, err := gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
 	return resp, nonceStr, err // Return the RAW nonce (preimage), not the hash!
+}
+
+// ConfirmationCertificate represents the certificate returned from storage nodes
+type ConfirmationCertificate struct {
+	Signers           []uint8 `json:"signers"`
+	SerializedMessage []uint8 `json:"serialized_message"`
+	Signature         string  `json:"signature"`
+}
+
+func (c *ConfirmationCertificate) GetDecodedSignature() ([]byte, error) {
+	return base64.StdEncoding.DecodeString(c.Signature)
+}
+
+// signersToWalrusBitmap converts signer indices to a plain bit-array.
+// committeeSize is n_members (103 for testnet), NOT n_shards (1000).
+// bitmap length = ceil(n_members / 8).
+func signersToWalrusBitmap(signerIndices []uint8, nMembers int) []byte {
+	bitmap := make([]byte, (nMembers+7)/8) // ceil(103/8) = 13 bytes
+	for _, idx := range signerIndices {
+		bitmap[idx/8] |= 1 << (idx % 8)
+	}
+	return bitmap
+}
+
+func (op *WalrusCertifyBlob) CertifyBlob(
+	conn *grpc.ClientConn,
+	mod api.Module,
+	acc *signer.Signer,
+	ctx context.Context,
+) (*pb.ExecuteTransactionResponse, error) {
+	b := gosuisdk.NewBuilder(ctx, mod)
+
+	if err := b.SetConfig(acc.Address, op.Gasbudget, op.Gasprice); err != nil {
+		return nil, err
+	}
+	if err := b.AddGasObject(*op.GasCoin.ObjectId, uint64(*op.GasCoin.Version), *op.GasCoin.Digest); err != nil {
+		return nil, fmt.Errorf("add gas object: %w", err)
+	}
+
+	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk.ObjectKindShared, true)
+	if err != nil {
+		return nil, fmt.Errorf("input system: %w", err)
+	}
+
+	blobArg, err := b.InputObject(op.BlobObjectId, op.BlobVersion, op.BlobDigest, gosuisdk.ObjectKindOwned, true)
+	if err != nil {
+		return nil, fmt.Errorf("input blob object: %w", err)
+	}
+
+	signatureBytes, err := op.Certificate.GetDecodedSignature()
+	if err != nil {
+		return nil, fmt.Errorf("decode signature: %w", err)
+	}
+
+	signersBitmap := signersToWalrusBitmap(op.Certificate.Signers, op.Config.NMembers)
+
+	// SerializedMessage is already []byte from JSON int array
+	msgBytes := op.Certificate.SerializedMessage
+
+	// Debug — remove once working
+	fmt.Printf("   sig len=%d  bitmap len=%d  msg len=%d\n",
+		len(signatureBytes), len(signersBitmap), len(msgBytes))
+
+	sigArg := b.PureRawBCS(encodeVectorU8(signatureBytes))
+	signersArg := b.PureRawBCS(encodeVectorU8(signersBitmap))
+	messageArg := b.PureRawBCS(encodeVectorU8(msgBytes))
+
+	_, err = b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"certify_blob",
+		[]string{},
+		[]gosuisdk.MoveCallArg{
+			gosuisdk.ArgID(sysArg),
+			gosuisdk.ArgID(blobArg),
+			gosuisdk.ArgID(sigArg),
+			gosuisdk.ArgID(signersArg),
+			gosuisdk.ArgID(messageArg),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("certify_blob move call failed: %w", err)
+	}
+
+	txBytes, err := b.Build()
+	if err != nil {
+		return nil, fmt.Errorf("build transaction: %w", err)
+	}
+
+	signed, err := gosuisdk.SignTransaction(txBytes, acc)
+	if err != nil {
+		return nil, fmt.Errorf("sign transaction: %w", err)
+	}
+
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, fmt.Errorf("decode signature: %w", err)
+	}
+
+	return gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
+}
+
+type WalrusCertifyBlob struct {
+	Gasbudget uint64
+	Gasprice  uint64
+
+	// The Blob Object created in registration
+	BlobObjectId string
+	BlobVersion  uint64
+	BlobDigest   string
+
+	// The confirmation certificate from storage nodes
+	Certificate *ConfirmationCertificate
+
+	GasCoin *pb.Object
+	Config  *CommitteeConfig
+}
+
+// Helper function to parse the certificate from upload response
+func ParseCertificate(certBytes []byte) (*ConfirmationCertificate, error) {
+	var cert ConfirmationCertificate
+	if err := json.Unmarshal(certBytes, &cert); err != nil {
+		return nil, fmt.Errorf("parse certificate: %w", err)
+	}
+	return &cert, nil
+}
+
+func encodeVectorU8(data []byte) []byte {
+	// Encode length as ULEB128
+	var lengthBytes []byte
+	length := uint64(len(data))
+
+	for {
+		byte := uint8(length & 0x7f)
+		length >>= 7
+		if length != 0 {
+			byte |= 0x80 // Set continuation bit
+		}
+		lengthBytes = append(lengthBytes, byte)
+		if length == 0 {
+			break
+		}
+	}
+
+	// Return length + data
+	result := make([]byte, 0, len(lengthBytes)+len(data))
+	result = append(result, lengthBytes...)
+	result = append(result, data...)
+	return result
+}
+
+func CommitteeInfo(ctx context.Context) (nMembers int, nShards int, err error) {
+	var client = sui.NewSuiClient(constant.SuiTestnetEndpoint)
+
+	resp, err := client.SuiXGetDynamicField(ctx, models.SuiXGetDynamicFieldRequest{
+		ObjectId: WAL_SYSTEM_OBJ_ID,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	committee, err := client.SuiGetObject(ctx, models.SuiGetObjectRequest{
+		ObjectId: resp.Data[0].ObjectId,
+		Options: models.SuiObjectDataOptions{
+			ShowType:    true,
+			ShowContent: true,
+		},
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	committeeFields, ok := committee.Data.Content.Fields["value"].(map[string]any)["fields"].(map[string]any)["committee"].(map[string]any)["fields"].(map[string]any)
+	if !ok {
+		return 0, 0, fmt.Errorf("unexpected committee structure")
+	}
+
+	members, ok := committeeFields["members"].([]any)
+	if !ok {
+		return 0, 0, fmt.Errorf("members field missing or wrong type")
+	}
+	nMembers = len(members)
+
+	// n_shards is a u16 — the JSON unmarshaler gives us either float64 or string
+	switch v := committeeFields["n_shards"].(type) {
+	case float64:
+		nShards = int(v)
+	case string:
+		_, err = fmt.Sscanf(v, "%d", &nShards)
+		if err != nil {
+			return 0, 0, fmt.Errorf("parse n_shards: %w", err)
+		}
+	default:
+		return 0, 0, fmt.Errorf("n_shards has unexpected type %T", committeeFields["n_shards"])
+	}
+
+	return nMembers, nShards, nil
+}
+
+// CommitteeConfig holds the on-chain committee parameters fetched at startup.
+type CommitteeConfig struct {
+	NMembers int
+	NShards  int
+}
+
+var committeeConfig *CommitteeConfig
+
+// InitCommitteeConfig fetches committee info once at startup and caches it.
+// Call this before making any transactions.
+func InitCommitteeConfig(ctx context.Context) error {
+	nMembers, nShards, err := CommitteeInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("init committee config: %w", err)
+	}
+	committeeConfig = &CommitteeConfig{
+		NMembers: nMembers,
+		NShards:  nShards,
+	}
+	fmt.Printf("   ✓ Committee: %d members, %d shards\n", nMembers, nShards)
+	return nil
+}
+
+// GetCommitteeConfig returns the cached committee config.
+// Panics if InitCommitteeConfig was not called first.
+func GetCommitteeConfig() *CommitteeConfig {
+	if committeeConfig == nil {
+		panic("committeeConfig not initialized: call InitCommitteeConfig first")
+	}
+	return committeeConfig
 }
