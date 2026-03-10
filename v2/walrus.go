@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/block-vision/sui-go-sdk/constant"
 	"github.com/block-vision/sui-go-sdk/models"
@@ -992,6 +993,45 @@ func (c *UploadRelayClient) UploadBlob(ctx context.Context, blobData []byte, opt
 	}
 
 	return &uploadResp, nil
+}
+
+// UploadBlobWithRetry retries until ctx deadline or maxAttempts (0 = unlimited).
+// Matches walrus-sui's approach: retry forever within a time budget.
+// Backoff: 100ms → 300ms (jittered), matching walrus quick_retry_config defaults.
+func (c *UploadRelayClient) UploadBlobWithRetry(
+	ctx context.Context,
+	blobData []byte,
+	opts UploadOptions,
+	maxAttempts int, // 0 = unlimited, rely on ctx deadline
+) (*UploadResponse, error) {
+	backoff := 100 * time.Millisecond
+	const maxBackoff = 300 * time.Millisecond
+
+	for attempt := 1; ; attempt++ {
+		resp, err := c.UploadBlob(ctx, blobData, opts)
+		if err == nil {
+			return resp, nil
+		}
+
+		if maxAttempts > 0 && attempt >= maxAttempts {
+			return nil, fmt.Errorf("upload failed after %d attempts: %w", attempt, err)
+		}
+
+		fmt.Printf("   ⚠️  Upload attempt %d failed: %v — retrying in %s\n",
+			attempt, err, backoff)
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("upload cancelled after %d attempts: %w", attempt, ctx.Err())
+		case <-time.After(backoff):
+		}
+
+		// Exponential backoff capped at 300ms, matching walrus quick_retry_config
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }
 
 func PayRelayTip(

@@ -175,7 +175,11 @@ func CompleteWalrusFlow(
 		opts.DeletableBlobObject = *blobObj.ObjectId
 	}
 
-	uploadResp, err := client.UploadBlob(ctx, blobData, opts)
+	// In CompleteWalrusFlow — give upload 5 minutes to succeed, retry freely within that
+	uploadCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	uploadResp, err := client.UploadBlobWithRetry(uploadCtx, blobData, opts, 0) // 0 = unlimited
 	if err != nil {
 		return fmt.Errorf("upload: %w", err)
 	}
