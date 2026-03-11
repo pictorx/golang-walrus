@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
 
 	"github.com/block-vision/sui-go-sdk/signer"
 	"github.com/tetratelabs/wazero"
@@ -67,7 +66,7 @@ func example(acc *signer.Signer, ctx context.Context) {
 	}
 
 	client := v2.NewClient("https://upload-relay.testnet.walrus.space")
-	client.HTTPClient.Timeout = 10 * time.Minute
+	//client.HTTPClient.Timeout = 10 * time.Minute
 
 	err = v2.CompleteWalrusFlow(
 		ctx,
@@ -76,6 +75,8 @@ func example(acc *signer.Signer, ctx context.Context) {
 		acc,
 		client,
 		blobData,
+		fmt.Sprintf("title-%x.txt",
+			randomSuffix),
 		cfg,
 		wasm,
 	)

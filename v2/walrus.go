@@ -731,6 +731,8 @@ type WalrusRegisterBlob struct {
 	// Resources
 	GasCoin *pb.Object
 	WalCoin *pb.Object
+
+	Metadata map[string]string
 }
 
 // ReserveAndRegisterBlob executes the reservation and registration in a single PTB
@@ -815,6 +817,58 @@ func (op *WalrusRegisterBlob) ReserveAndRegisterBlob(conn *grpc.ClientConn, mod 
 	)
 	if err != nil {
 		return nil, fmt.Errorf("register_blob failed: %w", err)
+	}
+
+	// After blobObjArg is returned from register_blob, before TransferObjects:
+	fmt.Println(len(op.Metadata))
+	if len(op.Metadata) > 0 {
+		// Command: metadata::new() → returns Metadata object
+		metaArg, err := b.MoveCall(
+			WAL_PKG_ID,
+			"metadata",
+			"new",
+			[]string{},
+			[]gosuisdk.MoveCallArg{},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("metadata::new: %w", err)
+		}
+
+		// Command: metadata::insert_or_update(meta, key, value) for each pair
+		for key, value := range op.Metadata {
+
+			keyArg := b.PureRawBCS(encodeVectorU8([]byte(key)))
+			valArg := b.PureRawBCS(encodeVectorU8([]byte(value)))
+			_, err = b.MoveCall(
+				WAL_PKG_ID,
+				"metadata",
+				"insert_or_update",
+				[]string{},
+				[]gosuisdk.MoveCallArg{
+					gosuisdk.ArgID(metaArg),
+					gosuisdk.ArgID(keyArg),
+					gosuisdk.ArgID(valArg),
+				},
+			)
+			if err != nil {
+				return nil, fmt.Errorf("metadata::insert_or_update: %w", err)
+			}
+		}
+
+		// Command: blob::add_metadata(blob, meta) — consumes meta
+		_, err = b.MoveCall(
+			WAL_PKG_ID,
+			"blob",
+			"add_metadata",
+			[]string{},
+			[]gosuisdk.MoveCallArg{
+				gosuisdk.ArgID(blobObjArg),
+				gosuisdk.ArgID(metaArg),
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("blob::add_metadata: %w", err)
+		}
 	}
 
 	// 6. Command C: Transfer the new Blob Object to Sender
@@ -1005,8 +1059,7 @@ func (c *UploadRelayClient) UploadBlobWithRetry(
 	maxAttempts int, // 0 = unlimited, rely on ctx deadline
 ) (*UploadResponse, error) {
 	backoff := 100 * time.Millisecond
-	const maxBackoff = 300 * time.Millisecond
-
+	const maxBackoff = 6000 * time.Second
 	for attempt := 1; ; attempt++ {
 		resp, err := c.UploadBlob(ctx, blobData, opts)
 		if err == nil {

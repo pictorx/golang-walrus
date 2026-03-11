@@ -21,6 +21,7 @@ func CompleteWalrusFlow(
 	acc *signer.Signer,
 	client *UploadRelayClient,
 	blobData []byte,
+	filename string,
 	cfg *CommitteeConfig,
 	wasm *WalrusWASM,
 ) error {
@@ -85,6 +86,9 @@ func CompleteWalrusFlow(
 		UnencodedLength: uint64(unencodedLen),
 		EncodingType:    uint8(encodingType),
 		Deletable:       true,
+		Metadata: map[string]string{
+			"file_name": filename,
+		},
 	}
 
 	regResp, err := register.ReserveAndRegisterBlob(conn, mod, acc, ctx)
@@ -176,10 +180,10 @@ func CompleteWalrusFlow(
 	}
 
 	// In CompleteWalrusFlow — give upload 5 minutes to succeed, retry freely within that
-	uploadCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	uploadCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
-	uploadResp, err := client.UploadBlobWithRetry(uploadCtx, blobData, opts, 0) // 0 = unlimited
+	uploadResp, err := client.UploadBlobWithRetry(uploadCtx, blobData, opts, 20) // 0 = unlimited
 	if err != nil {
 		return fmt.Errorf("upload: %w", err)
 	}
