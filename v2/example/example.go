@@ -1,5 +1,6 @@
 package main
 
+// export CGO_LDFLAGS="-L../go-sui-sdk/transaction/target/release" && export CGO_CFLAGS="-I../go-sui-sdk/transaction" && go build -tags txbuilder_cgo ./...
 import (
 	"context"
 	"crypto/rand"
@@ -27,8 +28,7 @@ func main() {
 		log.Fatalf("Failed to init committee config: %v", err)
 	}
 
-	example(account, ctx)
-
+	example2(account, ctx)
 }
 
 func example(acc *signer.Signer, ctx context.Context) {
@@ -72,6 +72,47 @@ func example(acc *signer.Signer, ctx context.Context) {
 		ctx,
 		conn,
 		mod,
+		acc,
+		client,
+		blobData,
+		fmt.Sprintf("title-%x.txt",
+			randomSuffix),
+		cfg,
+		wasm,
+	)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func example2(acc *signer.Signer, ctx context.Context) {
+	cfg := v2.GetCommitteeConfig()
+
+	wasm, err := v2.NewWalrusWASM(ctx, "../target/wasm32-wasip1/release/walrus_wasm_wazero.wasm")
+	if err != nil {
+		panic(err)
+	}
+	defer wasm.Close()
+
+	randomSuffix := make([]byte, 8)
+	rand.Read(randomSuffix)
+	blobData := []byte(fmt.Sprintf("Hello, Walrus! Test at %x",
+		randomSuffix))
+
+	fmt.Println("blob data: ", string(blobData))
+
+	conn, err := grpc.Dial(v2.RPC_ENDPOINT, grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
+	if err != nil {
+		log.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	client := v2.NewClient("https://upload-relay.testnet.walrus.space")
+	//client.HTTPClient.Timeout = 10 * time.Minute
+
+	err = v2.CompleteWalrusFlow2(
+		ctx,
+		conn,
 		acc,
 		client,
 		blobData,

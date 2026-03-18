@@ -21,6 +21,8 @@ import (
 	"github.com/block-vision/sui-go-sdk/signer"
 	"github.com/block-vision/sui-go-sdk/sui"
 	gosuisdk "github.com/pictorx/go-sui-sdk"
+	gosuisdk2 "github.com/pictorx/go-sui-sdk/v2"
+
 	pb "github.com/pictorx/go-sui-sdk/sui_rpc_proto/generated"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -670,6 +672,83 @@ func (reserve *WalrusReserveSpace) ReserveSpace(conn *grpc.ClientConn, mod api.M
 
 }
 
+func (reserve *WalrusReserveSpace) ReserveSpace2(conn *grpc.ClientConn, acc *signer.Signer, ctx context.Context) (*pb.ExecuteTransactionResponse, error) {
+	b := gosuisdk2.NewBuilder(ctx, nil)
+	if err := b.SetConfig(acc.Address, reserve.Gasbudget, reserve.Gasprice); err != nil {
+		return nil, err
+	}
+
+	if err := b.AddGasObject(*reserve.GasCoin.ObjectId, uint64(*reserve.GasCoin.Version), *reserve.GasCoin.Digest); err != nil {
+		return nil, fmt.Errorf("add gas object: %w", err)
+	}
+
+	// A. Inputs
+	// Shared Object: Walrus System
+	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk2.ObjectKindShared, true)
+	if err != nil {
+		return nil, fmt.Errorf("input system: %w", err)
+	}
+
+	// Owned Object: WAL Payment Coin
+	walArg, err := b.InputObject(*reserve.WalCoin.ObjectId, uint64(*reserve.WalCoin.Version), *reserve.WalCoin.Digest, gosuisdk2.ObjectKindOwned, false)
+	if err != nil {
+		return nil, fmt.Errorf("input wal coin: %w", err)
+	}
+
+	// Pure Arguments
+	amtArg := b.PureU64(reserve.Amount) // Amount of storage
+	perArg := b.PureU32(reserve.Epoch)  // Periods (Note: u32)
+
+	// B. Move Call: system::reserve_space
+	resArg, err := b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"reserve_space",
+		[]string{}, // No type arguments
+		[]gosuisdk2.MoveCallArg{
+			gosuisdk2.ArgID(sysArg),
+			gosuisdk2.ArgID(amtArg),
+			gosuisdk2.ArgID(perArg),
+			gosuisdk2.ArgID(walArg),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("move call: %w", err)
+	}
+
+	// C. Transfer Result (StorageGuard?) to Sender
+	recArg, err := b.PureAddress(acc.Address)
+	if err != nil {
+		return nil, err
+	}
+	b.TransferObjects([]uint64{resArg}, recArg)
+
+	TxBuildBytes, err := b.Build()
+	if err != nil {
+		return nil, err
+	}
+
+	// Sign
+	signed, err := gosuisdk.SignTransaction(TxBuildBytes, acc)
+	if err != nil {
+		return nil, fmt.Errorf("signing: %w", err)
+	}
+
+	// Decode Signature parts
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, err
+	}
+
+	// Execute
+	resp, err := gosuisdk.SignExecuteTransaction(conn, TxBuildBytes, sigRaw, ctx)
+	if err != nil {
+		return nil, err
+	}
+	return resp, err
+
+}
+
 func FindCoins(ctx context.Context, conn *grpc.ClientConn, owner string) (gas *pb.Object, wal *pb.Object, err error) {
 	// We iterate owned objects to find one SUI coin and one WAL coin
 	// In production, you'd want to merge coins if balances are too small.
@@ -864,6 +943,171 @@ func (op *WalrusRegisterBlob) ReserveAndRegisterBlob(conn *grpc.ClientConn, mod 
 			[]gosuisdk.MoveCallArg{
 				gosuisdk.ArgID(blobObjArg),
 				gosuisdk.ArgID(metaArg),
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("blob::add_metadata: %w", err)
+		}
+	}
+
+	// 6. Command C: Transfer the new Blob Object to Sender
+	recArg, err := b.PureAddress(acc.Address)
+	if err != nil {
+		return nil, err
+	}
+	// Transfer the result of register_blob (blobObjArg)
+	if err := b.TransferObjects([]uint64{blobObjArg}, recArg); err != nil {
+		return nil, fmt.Errorf("transfer failed: %w", err)
+	}
+
+	// 7. Build, Sign, Execute
+	txBytes, err := b.Build()
+	if err != nil {
+		return nil, err
+	}
+
+	signed, err := gosuisdk.SignTransaction(txBytes, acc)
+	if err != nil {
+		return nil, fmt.Errorf("signing: %w", err)
+	}
+
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, err
+	}
+
+	// Using standard ExecuteTransaction (assuming signature scheme handling is in place)
+	return gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
+}
+
+func (op *WalrusRegisterBlob) ReserveAndRegisterBlob2(conn *grpc.ClientConn, acc *signer.Signer, ctx context.Context) (*pb.ExecuteTransactionResponse, error) {
+	b := gosuisdk2.NewBuilder(ctx, nil)
+
+	// 1. Configure Transaction
+	if err := b.SetConfig(acc.Address, op.Gasbudget, op.Gasprice); err != nil {
+		return nil, err
+	}
+	// Add Gas Payment
+	if err := b.AddGasObject(*op.GasCoin.ObjectId, uint64(*op.GasCoin.Version), *op.GasCoin.Digest); err != nil {
+		return nil, fmt.Errorf("add gas object: %w", err)
+	}
+
+	// 2. Prepare Inputs
+	// Shared Object: Walrus System
+	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk2.ObjectKindShared, true)
+	if err != nil {
+		return nil, fmt.Errorf("input system: %w", err)
+	}
+
+	// Owned Object: WAL Coin for payment
+	// IMPORTANT: This will be used by BOTH reserve_space and register_blob
+	// The Move functions should take &mut Coin<WAL>, not Coin<WAL> by value
+	walArg, err := b.InputObject(*op.WalCoin.ObjectId, uint64(*op.WalCoin.Version), *op.WalCoin.Digest, gosuisdk2.ObjectKindOwned, false)
+	if err != nil {
+		return nil, fmt.Errorf("input wal coin: %w", err)
+	}
+
+	// 3. Define Pure Arguments
+	// For reserve_space
+	amtArg := b.PureU64(op.Amount)
+	epochArg := b.PureU32(op.Epochs)
+
+	// For register_blob - must create separate args even if same value
+	// to ensure they're both added as transaction inputs
+	sizeArg := b.PureU64(op.UnencodedLength)
+	encArg := b.PureU8(op.EncodingType)
+	deletableArg := b.PureBool(op.Deletable)
+
+	// Blob Meta: Use PureRawBCS for byte arrays (u256 equivalent)
+	blobIdArg := b.PureRawBCS(op.BlobId[:])
+	rootHashArg := b.PureRawBCS(op.RootHash[:])
+
+	// 4. Command A: reserve_space
+	// Returns: Storage resource
+	storageArg, err := b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"reserve_space",
+		[]string{}, // No type args
+		[]gosuisdk2.MoveCallArg{
+			gosuisdk2.ArgID(sysArg),
+			gosuisdk2.ArgID(amtArg),
+			gosuisdk2.ArgID(epochArg),
+			gosuisdk2.ArgID(walArg),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("reserve_space failed: %w", err)
+	}
+
+	// 5. Command B: register_blob
+	// Uses the storageArg from the previous command
+	// NOTE: Still needs WAL coin for metadata/registration costs (separate from storage)
+	blobObjArg, err := b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"register_blob",
+		[]string{},
+		[]gosuisdk2.MoveCallArg{
+			gosuisdk2.ArgID(sysArg),       // &mut System
+			gosuisdk2.ArgID(storageArg),   // Storage (consumed from reserve_space)
+			gosuisdk2.ArgID(blobIdArg),    // u256 blob_id
+			gosuisdk2.ArgID(rootHashArg),  // u256 root_hash
+			gosuisdk2.ArgID(sizeArg),      // u64 size
+			gosuisdk2.ArgID(encArg),       // u8 encoding_type
+			gosuisdk2.ArgID(deletableArg), // bool deletable
+			gosuisdk2.ArgID(walArg),       // Coin<WAL> for metadata costs
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("register_blob failed: %w", err)
+	}
+
+	// After blobObjArg is returned from register_blob, before TransferObjects:
+	fmt.Println(len(op.Metadata))
+	if len(op.Metadata) > 0 {
+		// Command: metadata::new() → returns Metadata object
+		metaArg, err := b.MoveCall(
+			WAL_PKG_ID,
+			"metadata",
+			"new",
+			[]string{},
+			[]gosuisdk2.MoveCallArg{},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("metadata::new: %w", err)
+		}
+
+		// Command: metadata::insert_or_update(meta, key, value) for each pair
+		for key, value := range op.Metadata {
+
+			keyArg := b.PureRawBCS(encodeVectorU8([]byte(key)))
+			valArg := b.PureRawBCS(encodeVectorU8([]byte(value)))
+			_, err = b.MoveCall(
+				WAL_PKG_ID,
+				"metadata",
+				"insert_or_update",
+				[]string{},
+				[]gosuisdk2.MoveCallArg{
+					gosuisdk2.ArgID(metaArg),
+					gosuisdk2.ArgID(keyArg),
+					gosuisdk2.ArgID(valArg),
+				},
+			)
+			if err != nil {
+				return nil, fmt.Errorf("metadata::insert_or_update: %w", err)
+			}
+		}
+
+		// Command: blob::add_metadata(blob, meta) — consumes meta
+		_, err = b.MoveCall(
+			WAL_PKG_ID,
+			"blob",
+			"add_metadata",
+			[]string{},
+			[]gosuisdk2.MoveCallArg{
+				gosuisdk2.ArgID(blobObjArg),
+				gosuisdk2.ArgID(metaArg),
 			},
 		)
 		if err != nil {
@@ -1173,6 +1417,91 @@ func PayRelayTip(
 	return resp, nonceStr, err // Return the RAW nonce (preimage), not the hash!
 }
 
+func PayRelayTip2(
+	ctx context.Context,
+	conn *grpc.ClientConn,
+	acc *signer.Signer,
+	blobData []byte,
+	tipAmount uint64,
+	recipient string,
+	gasCoin *pb.Object,
+	gasPrice uint64,
+	gasBudget uint64,
+) (*pb.ExecuteTransactionResponse, string, error) {
+	// 1. Generate 32-byte nonce
+	nonceRaw := make([]byte, 32)
+	if _, err := rand.Read(nonceRaw); err != nil {
+		return nil, "", fmt.Errorf("failed to generate nonce: %w", err)
+	}
+
+	// THIS is what goes in the URL - the RAW preimage
+	nonceStr := base64.RawURLEncoding.EncodeToString(nonceRaw)
+
+	// 2. Construct Auth Message
+	// Hash the blob data
+	blobHash := sha256.Sum256(blobData)
+
+	// Hash the nonce for the auth package
+	nonceHash := sha256.Sum256(nonceRaw)
+
+	// Length as u64 little-endian (8 bytes)
+	lenBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(lenBytes, uint64(len(blobData)))
+
+	// Construct: blob_digest || nonce_digest || length
+	var authPayload []byte
+	authPayload = append(authPayload, blobHash[:]...)
+	authPayload = append(authPayload, nonceHash[:]...)
+	authPayload = append(authPayload, lenBytes...)
+
+	// BCS encode with length prefix
+	//bcsAuthInput := append([]byte{byte(len(authPayload))}, authPayload...)
+
+	// 3. Build Transaction
+	b := gosuisdk2.NewBuilder(ctx, nil)
+	if err := b.SetConfig(acc.Address, gasBudget, gasPrice); err != nil {
+		return nil, "", err
+	}
+	if err := b.AddGasObject(*gasCoin.ObjectId, uint64(*gasCoin.Version), *gasCoin.Digest); err != nil {
+		return nil, "", err
+	}
+
+	// Input 0: Auth Message
+	//b.PureRawBCS(bcsAuthInput)
+	b.PureRawBCS(authPayload)
+
+	// Commands
+	gasArg := b.GasArgument()
+	amtArg := b.PureU64(tipAmount)
+	recArg, _ := b.PureAddress(recipient)
+
+	splitRes, err := b.SplitCoins(gasArg, []uint64{amtArg})
+	if err != nil {
+		return nil, "", err
+	}
+	tipCoin := b.NestedResult(splitRes, 0)
+	b.TransferObjects([]uint64{tipCoin}, recArg)
+
+	// 4. Sign & Execute
+	txBytes, err := b.Build()
+	if err != nil {
+		return nil, "", err
+	}
+
+	signed, err := gosuisdk.SignTransaction(txBytes, acc)
+	if err != nil {
+		return nil, "", err
+	}
+
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, "", err
+	}
+
+	resp, err := gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
+	return resp, nonceStr, err // Return the RAW nonce (preimage), not the hash!
+}
+
 // ConfirmationCertificate represents the certificate returned from storage nodes
 type ConfirmationCertificate struct {
 	Signers           []uint8 `json:"signers"`
@@ -1249,6 +1578,83 @@ func (op *WalrusCertifyBlob) CertifyBlob(
 			gosuisdk.ArgID(sigArg),
 			gosuisdk.ArgID(signersArg),
 			gosuisdk.ArgID(messageArg),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("certify_blob move call failed: %w", err)
+	}
+
+	txBytes, err := b.Build()
+	if err != nil {
+		return nil, fmt.Errorf("build transaction: %w", err)
+	}
+
+	signed, err := gosuisdk.SignTransaction(txBytes, acc)
+	if err != nil {
+		return nil, fmt.Errorf("sign transaction: %w", err)
+	}
+
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, fmt.Errorf("decode signature: %w", err)
+	}
+
+	return gosuisdk.SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
+}
+
+func (op *WalrusCertifyBlob) CertifyBlob2(
+	conn *grpc.ClientConn,
+	acc *signer.Signer,
+	ctx context.Context,
+) (*pb.ExecuteTransactionResponse, error) {
+	b := gosuisdk2.NewBuilder(ctx, nil)
+
+	if err := b.SetConfig(acc.Address, op.Gasbudget, op.Gasprice); err != nil {
+		return nil, err
+	}
+	if err := b.AddGasObject(*op.GasCoin.ObjectId, uint64(*op.GasCoin.Version), *op.GasCoin.Digest); err != nil {
+		return nil, fmt.Errorf("add gas object: %w", err)
+	}
+
+	sysArg, err := b.InputObject(WAL_SYSTEM_OBJ_ID, WAL_SYSTEM_VERSION, "", gosuisdk2.ObjectKindShared, true)
+	if err != nil {
+		return nil, fmt.Errorf("input system: %w", err)
+	}
+
+	blobArg, err := b.InputObject(op.BlobObjectId, op.BlobVersion, op.BlobDigest, gosuisdk2.ObjectKindOwned, true)
+	if err != nil {
+		return nil, fmt.Errorf("input blob object: %w", err)
+	}
+
+	signatureBytes, err := op.Certificate.GetDecodedSignature()
+	if err != nil {
+		return nil, fmt.Errorf("decode signature: %w", err)
+	}
+
+	signersBitmap := signersToWalrusBitmap(op.Certificate.Signers, op.Config.NMembers)
+
+	// SerializedMessage is already []byte from JSON int array
+	msgBytes := op.Certificate.SerializedMessage
+
+	// Debug — remove once working
+	fmt.Printf("   sig len=%d  bitmap len=%d  msg len=%d\n",
+		len(signatureBytes), len(signersBitmap), len(msgBytes))
+
+	sigArg := b.PureRawBCS(encodeVectorU8(signatureBytes))
+	signersArg := b.PureRawBCS(encodeVectorU8(signersBitmap))
+	messageArg := b.PureRawBCS(encodeVectorU8(msgBytes))
+
+	_, err = b.MoveCall(
+		WAL_PKG_ID,
+		"system",
+		"certify_blob",
+		[]string{},
+		[]gosuisdk2.MoveCallArg{
+			gosuisdk2.ArgID(sysArg),
+			gosuisdk2.ArgID(blobArg),
+			gosuisdk2.ArgID(sigArg),
+			gosuisdk2.ArgID(signersArg),
+			gosuisdk2.ArgID(messageArg),
 		},
 	)
 	if err != nil {
