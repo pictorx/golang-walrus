@@ -1,0 +1,14 @@
+# Default genqlient config; for full documentation see:
+# https://github.com/Khan/genqlient/blob/main/docs/genqlient.yaml
+schema: schema.graphql
+operations:
+- genqlient.graphql
+generated: generated.go
+bindings:
+  # SuiAddress scalar → your local type defined in types.go (same package, no import needed)
+  SuiAddress:
+    type: string
+  Base64:
+    type: string
+  JSON:
+    type: encoding/json.RawMessage

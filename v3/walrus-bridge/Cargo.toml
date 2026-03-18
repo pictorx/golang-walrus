@@ -1,0 +1,18 @@
+[package]
+name = "walrus_bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "walrus_go_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+walrus-sdk = { git = "https://github.com/mystenlabs/walrus.git", branch = "main", package = "walrus-sdk" }
+walrus-sui = { git = "https://github.com/mystenlabs/walrus.git", branch = "main", package = "walrus-sui" }
+
+tokio  = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time"] }
+anyhow = "1.0"
+serde  = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
