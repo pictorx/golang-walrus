@@ -310,7 +310,10 @@ func PayRelayTip(
 	if err != nil {
 		return nil, fmt.Errorf("tip PTB split coins: %w", err)
 	}
-	tipCoin := b.NestedResult(splitRes, 0)
+	tipCoin, err := b.NestedResult(splitRes, 0)
+	if err != nil {
+		return nil, err
+	}
 	b.TransferObjects([]uint64{tipCoin}, recArg)
 
 	// ── 4. Sign and execute ───────────────────────────────────────────────────

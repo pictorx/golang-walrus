@@ -312,8 +312,13 @@ impl TransactionBuilder {
 
     // Building and resolving
 
-    /// Assuming everything is resolved, convert this transaction into the
-    /// resolved form. Returns a [`Transaction`] if successful, or an `Error` if not.
+    /// Assuming everything is resolved, convert this transaction into the resolved form.
+    /// Returns a [`Transaction`] if successful, or an `Error` if not.
+    ///
+    /// This is the offline path: it does not contact an RPC node and cannot resolve
+    /// `CoinWithBalance` or other network intents. If the builder contains unresolved intents,
+    /// it returns `Err(Error::Input("unable to resolve intents offline"))`.
+    /// For online resolution use [`build`].
     pub fn try_build(mut self) -> Result<Transaction, Error> {
         let Some(sender) = self.sender else {
             return Err(Error::MissingSender);
@@ -376,10 +381,22 @@ impl TransactionBuilder {
         let mut resolved_commands = Vec::new();
 
         for (id, command) in self.commands {
+            // FIXED: was `.map_err(|e| e.unwrap_err())?` which panics when try_resolve returns
+            // Err(Ok(unresolved_id)) — i.e. when a forward-reference hasn't been resolved yet.
+            // Although the current API produces arguments in strictly ascending-ID order (making
+            // this path unreachable in practice), the panic was entirely silent and gave no
+            // diagnostic. Replaced with a proper Error return so any future regression is caught
+            // cleanly rather than crashing the process.
             resolved_commands.push(
                 command
                     .try_resolve(&self.arguments)
-                    .map_err(|e| e.unwrap_err())?,
+                    .map_err(|e| match e {
+                        Ok(unresolved_id) => Error::Input(format!(
+                            "argument {unresolved_id} is unresolved in offline build; \
+                             use build() with an RPC client for intent resolution"
+                        )),
+                        Err(e) => e,
+                    })?,
             );
             let arg = sui_sdk_types::Argument::Result(resolved_commands.len() as u16 - 1);
 
@@ -593,8 +610,8 @@ impl TransactionBuilder {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Argument {
-    pub(crate) id: usize,        // CHANGED: Added pub(crate)
-    pub(crate) sub_index: Option<usize>, // CHANGED: Added pub(crate)
+    pub(crate) id: usize,
+    pub(crate) sub_index: Option<usize>,
 }
 
 impl Argument {
@@ -869,7 +886,6 @@ pub(crate) struct MoveCall {
 
     /// The arguments to the function.
     pub arguments: Vec<Argument>,
-    // Return value count??
 }
 
 pub struct ObjectInput {
@@ -1021,7 +1037,7 @@ impl From<&sui_sdk_types::Object> for ObjectInput {
 
 // impl TryFrom<&sui_rpc::proto::sui::rpc::v2::Object> for ObjectInput {
 //     type Error = sui_rpc::proto::TryFromProtoError;
-
+//
 //     fn try_from(object: &sui_rpc::proto::sui::rpc::v2::Object) -> Result<Self, Self::Error> {
 //         todo!()
 //     }
@@ -1030,15 +1046,14 @@ impl From<&sui_sdk_types::Object> for ObjectInput {
 // private conversions
 impl ObjectInput {
     fn try_into_object_reference(&self) -> Result<sui_sdk_types::ObjectReference, Error> {
-        // FIXED: Replaced experimental `if let` chains with standard nested ifs
         if matches!(self.kind, Some(ObjectKind::ImmutableOrOwned) | None) {
-             if let (Some(version), Some(digest)) = (self.version, self.digest) {
-                 return Ok(sui_sdk_types::ObjectReference::new(
+            if let (Some(version), Some(digest)) = (self.version, self.digest) {
+                return Ok(sui_sdk_types::ObjectReference::new(
                     self.object_id,
                     version,
                     digest,
                 ));
-             }
+            }
         }
         Err(Error::WrongGasObject)
     }

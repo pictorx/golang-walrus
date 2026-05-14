@@ -79,10 +79,19 @@ impl IntentResolver for CoinWithBalanceResolver {
         let mut requests: BTreeMap<CoinType, Vec<(usize, u64)>> = BTreeMap::new();
         let mut zero_values = Vec::new();
 
+        // FIXED: was calling `intent.downcast_ref::<CoinWithBalance>()` twice —
+        // once in the extract_if predicate (borrow) and again after extraction
+        // (another borrow + unwrap).  Since Rust 1.70, Box<dyn Any + Send + Sync>
+        // supports `downcast::<T>()` which consumes the box and returns
+        // `Result<Box<T>, Box<dyn Any + Send + Sync>>`.  We use that here to
+        // do exactly one type check and produce an owned `Box<CoinWithBalance>`.
         for (id, intent) in builder.intents.extract_if(.., |_id, intent| {
             intent.downcast_ref::<CoinWithBalance>().is_some()
         }) {
-            let request = intent.downcast_ref::<CoinWithBalance>().unwrap();
+            // SAFETY: the filter predicate above confirmed the concrete type.
+            let request: Box<CoinWithBalance> = intent
+                .downcast::<CoinWithBalance>()
+                .expect("BUG: downcast failed after type-check in extract_if predicate");
 
             if request.balance == 0 {
                 zero_values.push((id, request.coin_type.clone()));

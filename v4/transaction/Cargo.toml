@@ -2,6 +2,8 @@
 name = "transaction-builder"
 version = "0.1.0"
 edition = "2021"
+# BTreeMap::extract_if (with range argument) was stabilised in Rust 1.83.
+rust-version = "1.83"
 
 [lib]
 crate-type = ["cdylib"]
@@ -13,7 +15,7 @@ intents = ["dep:sui-rpc", "dep:async-trait"]
 [dependencies]
 bcs = "0.1.6"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0" 
+serde_json = "1.0"
 sui-sdk-types = {git = "https://github.com/MystenLabs/sui-rust-sdk.git", tag = "sui-rpc-0.2.2", features = ["serde", "hash"]}
 thiserror = "2.0"
 

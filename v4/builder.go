@@ -7,11 +7,11 @@
 //	b, err := txbuilder.NewBuilder(ctx, mod)
 //	b.SetConfig(sender, 10_000_000, 1_000)
 //	b.AddGasObject(id, version, digest)
-//	gasID  := b.GasArgument()
-//	amtID  := b.PureU64(100_000_000)
-//	baseID := b.SplitCoins(gasID, []uint64{amtID})
-//	coinID := b.NestedResult(baseID, 0)
-//	recID  := b.PureAddress("0xabc…")
+//	gasID        := b.GasArgument()
+//	amtID        := b.PureU64(100_000_000)
+//	baseID, err  := b.SplitCoins(gasID, []uint64{amtID})
+//	coinID, err  := b.NestedResult(baseID, 0)   // now returns (uint64, error)
+//	recID,  err  := b.PureAddress("0xabc…")
 //	b.TransferObjects([]uint64{coinID}, recID)
 //	bcsBytes, err := b.Build()
 
@@ -98,6 +98,56 @@ func (b *Builder) Free() {
 	}
 }
 
+// ── Error helper ──────────────────────────────────────────────────────────────
+
+// lastError reads the last error message stored by the Rust WASM module via
+// last_error_message and returns it as a Go error.
+// Falls back to fallback if no Rust-side message is available.
+//
+// IMPORTANT: call this immediately after a failing FFI call, before any other
+// WASM call on the same goroutine.  The string pointer returned by Rust points
+// into thread-local storage and is only valid until the next FFI call.
+func (b *Builder) lastError(fallback string) error {
+	// Allocate 4 bytes in WASM for the usize (= u32 on wasm32) length output.
+	lenPtrRes, err := b.mod.ExportedFunction("alloc").Call(b.ctx, 4)
+	if err != nil || len(lenPtrRes) == 0 {
+		return fmt.Errorf("%s", fallback)
+	}
+	lenPtr := lenPtrRes[0]
+	defer b.mod.ExportedFunction("dealloc").Call(b.ctx, lenPtr, 4) //nolint:errcheck
+
+	// last_error_message(len_out: *mut usize) -> *const u8
+	// Writes the byte-length of the error string into *lenPtr and returns a
+	// pointer to the UTF-8 string data inside Rust thread-local storage.
+	msgPtrRes, err := b.mod.ExportedFunction("last_error_message").Call(b.ctx, lenPtr)
+	if err != nil || len(msgPtrRes) == 0 {
+		return fmt.Errorf("%s", fallback)
+	}
+	strPtr := uint32(msgPtrRes[0])
+	if strPtr == 0 {
+		// No error recorded on the Rust side; use caller-supplied fallback.
+		return fmt.Errorf("%s", fallback)
+	}
+
+	// Read the 4-byte little-endian length written into lenPtr.
+	// On wasm32, usize = u32, so Rust writes exactly 4 bytes.
+	lenBytes, ok := b.mod.Memory().Read(uint32(lenPtr), 4)
+	if !ok {
+		return fmt.Errorf("%s", fallback)
+	}
+	strLen := binary.LittleEndian.Uint32(lenBytes)
+	if strLen == 0 {
+		return fmt.Errorf("%s", fallback)
+	}
+
+	// Read the UTF-8 error string from WASM linear memory.
+	msgBytes, ok := b.mod.Memory().Read(strPtr, strLen)
+	if !ok {
+		return fmt.Errorf("%s", fallback)
+	}
+	return fmt.Errorf("%s", string(msgBytes))
+}
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 // SetConfig sets the sender address, gas budget, and gas price.
@@ -112,7 +162,7 @@ func (b *Builder) SetConfig(sender string, gasBudget, gasPrice uint64) error {
 	defer freeBytes_(b.ctx, b.mod, ptr, size)
 	code := int32(callFn(b.ctx, b.mod, "set_config", b.ptr, ptr, size)[0])
 	if code != 1 {
-		return fmt.Errorf("set_config failed (code %d) — check sender address format", code)
+		return b.lastError(fmt.Sprintf("set_config failed (code %d) — check sender address format", code))
 	}
 	return nil
 }
@@ -134,9 +184,9 @@ func (b *Builder) AddGasObject(id string, version uint64, digest string) error {
 	case 1:
 		return nil
 	case -2:
-		return fmt.Errorf("add_gas_object: invalid digest %q", digest)
+		return b.lastError(fmt.Sprintf("add_gas_object: invalid digest %q", digest))
 	default:
-		return fmt.Errorf("add_gas_object failed (code %d)", code)
+		return b.lastError(fmt.Sprintf("add_gas_object failed (code %d)", code))
 	}
 }
 
@@ -144,8 +194,14 @@ func (b *Builder) AddGasObject(id string, version uint64, digest string) error {
 
 // GasArgument returns the Argument ID for the transaction's gas coin.
 // Idempotent — always returns the same ID within one builder.
+//
+// CHANGED: gas_argument now returns i64 in Rust (was u64) to match the
+// convention of all other argument-returning FFI functions.  It can never be
+// negative, so the Go return type remains uint64.
 func (b *Builder) GasArgument() uint64 {
-	return callFn(b.ctx, b.mod, "gas_argument", b.ptr)[0]
+	res := int64(callFn(b.ctx, b.mod, "gas_argument", b.ptr)[0])
+	// gas_argument cannot fail; always returns a valid non-negative argument ID.
+	return uint64(res)
 }
 
 // ── Object inputs ─────────────────────────────────────────────────────────────
@@ -180,7 +236,7 @@ func (b *Builder) InputObject(id string, version uint64, digest string, kind Obj
 	defer freeBytes_(b.ctx, b.mod, ptr, size)
 	res := int64(callFn(b.ctx, b.mod, "input_object", b.ptr, ptr, size)[0])
 	if res < 0 {
-		return 0, fmt.Errorf("input_object failed (code %d)", res)
+		return 0, b.lastError(fmt.Sprintf("input_object failed (code %d)", res))
 	}
 	return uint64(res), nil
 }
@@ -218,8 +274,15 @@ func (b *Builder) PureU64(v uint64) uint64 {
 
 // PureU128 pushes a BCS-encoded u128 (supplied as high/low uint64 halves)
 // and returns its Argument ID.
+//
+// CHANGED: the old Rust signature was pure_u128(builder, lo, hi) and this
+// method compensated by passing (lo, hi) despite the Go parameter order being
+// (hi, lo).  The Rust signature is now pure_u128(builder, hi, lo), matching
+// the natural convention, so the internal call order is corrected to (hi, lo).
+// The Go method signature is unchanged.
 func (b *Builder) PureU128(hi, lo uint64) uint64 {
-	return uint64(callFn(b.ctx, b.mod, "pure_u128", b.ptr, lo, hi)[0])
+	// Rust: pure_u128(builder, hi, lo) — hi is the high 64 bits, lo the low 64 bits.
+	return uint64(callFn(b.ctx, b.mod, "pure_u128", b.ptr, hi, lo)[0])
 }
 
 // PureAddress pushes a BCS-encoded Sui address (bare 0x-prefixed hex string)
@@ -229,7 +292,7 @@ func (b *Builder) PureAddress(addr string) (uint64, error) {
 	defer freeBytes_(b.ctx, b.mod, ptr, size)
 	res := int64(callFn(b.ctx, b.mod, "pure_address", b.ptr, ptr, size)[0])
 	if res < 0 {
-		return 0, fmt.Errorf("pure_address: invalid address %q", addr)
+		return 0, b.lastError(fmt.Sprintf("pure_address: invalid address %q", addr))
 	}
 	return uint64(res), nil
 }
@@ -248,13 +311,25 @@ func (b *Builder) PureRawBCS(bcsBytes []byte) uint64 {
 // NestedResult returns the Argument ID for the Nth sub-result of a
 // multi-output command (e.g. the Kth coin from SplitCoins).
 // baseID is the value returned by SplitCoins; subIndex is 0-based.
-func (b *Builder) NestedResult(baseID, subIndex uint64) uint64 {
-	return uint64(callFn(b.ctx, b.mod, "nested_result", b.ptr, baseID, subIndex)[0])
+//
+// CHANGED: now returns (uint64, error) because the Rust implementation
+// validates that baseID exists and refers to a command result, returning -1
+// or -2 on invalid input rather than silently inserting a dangling reference
+// that would produce an opaque NULL from Build() later.
+func (b *Builder) NestedResult(baseID, subIndex uint64) (uint64, error) {
+	res := int64(callFn(b.ctx, b.mod, "nested_result", b.ptr, baseID, subIndex)[0])
+	if res < 0 {
+		return 0, b.lastError(fmt.Sprintf(
+			"nested_result: invalid base_id %d or sub_index %d (code %d)",
+			baseID, subIndex, res,
+		))
+	}
+	return uint64(res), nil
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
-// MoveCallArgs describes a single argument to a Move call.
+// MoveCallArg describes a single argument to a Move call.
 // Supply exactly one of ArgID (existing Argument) or PureBCS (raw bytes).
 type MoveCallArg struct {
 	ArgID   *uint64 // reference an existing Argument by ID
@@ -287,7 +362,7 @@ func (b *Builder) MoveCall(pkg, module, function string, typeArgs []string, args
 	defer freeBytes_(b.ctx, b.mod, ptr, size)
 	res := int64(callFn(b.ctx, b.mod, "command_move_call", b.ptr, ptr, size)[0])
 	if res < 0 {
-		return 0, fmt.Errorf("command_move_call failed (code %d)", res)
+		return 0, b.lastError(fmt.Sprintf("command_move_call failed (code %d)", res))
 	}
 	return uint64(res), nil
 }
@@ -313,7 +388,7 @@ func (b *Builder) SplitCoins(coinArgID uint64, amountArgIDs []uint64) (uint64, e
 		b.ptr, coinArgID, amidsPtr, uint64(len(amountArgIDs)),
 	)[0])
 	if res < 0 {
-		return 0, fmt.Errorf("command_split_coins failed (code %d)", res)
+		return 0, b.lastError(fmt.Sprintf("command_split_coins failed (code %d)", res))
 	}
 	return uint64(res), nil
 }
@@ -330,7 +405,7 @@ func (b *Builder) MergeCoins(targetCoinArgID uint64, sourceArgIDs []uint64) erro
 		b.ptr, targetCoinArgID, srcsPtr, uint64(len(sourceArgIDs)),
 	)[0])
 	if code != 1 {
-		return fmt.Errorf("command_merge_coins failed (code %d)", code)
+		return b.lastError(fmt.Sprintf("command_merge_coins failed (code %d)", code))
 	}
 	return nil
 }
@@ -347,7 +422,7 @@ func (b *Builder) TransferObjects(objectArgIDs []uint64, recipientArgID uint64) 
 		b.ptr, objsPtr, uint64(len(objectArgIDs)), recipientArgID,
 	)[0])
 	if code != 1 {
-		return fmt.Errorf("command_transfer_objects failed (code %d)", code)
+		return b.lastError(fmt.Sprintf("command_transfer_objects failed (code %d)", code))
 	}
 	return nil
 }
@@ -367,7 +442,7 @@ func (b *Builder) MakeMoveVec(typeTag string, elemArgIDs []uint64) (uint64, erro
 		b.ptr, ttPtr, ttSize, elemsPtr, uint64(len(elemArgIDs)),
 	)[0])
 	if res < 0 {
-		return 0, fmt.Errorf("command_make_move_vec failed (code %d)", res)
+		return 0, b.lastError(fmt.Sprintf("command_make_move_vec failed (code %d)", res))
 	}
 	return uint64(res), nil
 }
@@ -385,7 +460,7 @@ func (b *Builder) Publish(modules [][]byte, dependencies []string) (uint64, erro
 	defer freeBytes_(b.ctx, b.mod, ptr, size)
 	res := int64(callFn(b.ctx, b.mod, "command_publish", b.ptr, ptr, size)[0])
 	if res < 0 {
-		return 0, fmt.Errorf("command_publish failed (code %d)", res)
+		return 0, b.lastError(fmt.Sprintf("command_publish failed (code %d)", res))
 	}
 	return uint64(res), nil
 }
@@ -406,7 +481,7 @@ func (b *Builder) Upgrade(modules [][]byte, dependencies []string, packageID str
 	defer freeBytes_(b.ctx, b.mod, ptr, size)
 	res := int64(callFn(b.ctx, b.mod, "command_upgrade", b.ptr, ptr, size)[0])
 	if res < 0 {
-		return 0, fmt.Errorf("command_upgrade failed (code %d)", res)
+		return 0, b.lastError(fmt.Sprintf("command_upgrade failed (code %d)", res))
 	}
 	return uint64(res), nil
 }
@@ -416,31 +491,47 @@ func (b *Builder) Upgrade(modules [][]byte, dependencies []string, packageID str
 // Build serialises the transaction to BCS bytes and returns them.
 // The builder is consumed — do NOT call Free() after a successful Build().
 // Returns an error if any required field (sender, gas, budget, price) is
-// missing or if there are no commands.
+// missing, or if there are unresolved intents or no commands.
 func (b *Builder) Build() ([]byte, error) {
 	res := callFn(b.ctx, b.mod, "build_transaction", b.ptr)
-	b.ptr = 0 // builder is consumed regardless
+	b.ptr = 0 // builder is consumed regardless of outcome
 	resPtr := uint32(res[0])
 	if resPtr == 0 {
-		return nil, fmt.Errorf("build_transaction failed — ensure sender, gas object, gas_budget, gas_price and at least one command are set")
+		// CHANGED: read the real error from the Rust thread-local slot rather than
+		// returning a generic message.  This surfaces the exact failure reason
+		// (missing sender, missing gas, unresolved intents, BCS serialisation
+		// error, etc.) directly from the Rust side.
+		return nil, b.lastError(
+			"build_transaction failed — ensure sender, gas object, gas_budget, " +
+				"gas_price and at least one command are set",
+		)
 	}
 
-	// Read 4-byte LE length prefix.
+	// Read the 4-byte little-endian payload length prefix.
 	lenBytes, ok := b.mod.Memory().Read(resPtr, 4)
 	if !ok {
-		callFn(b.ctx, b.mod, "free_bytes", uint64(resPtr), 0)
-		return nil, fmt.Errorf("build_transaction: failed to read length prefix")
+		// WASM memory is fundamentally broken; free the header as best-effort.
+		callFn(b.ctx, b.mod, "free_bytes", uint64(resPtr), 4)
+		return nil, fmt.Errorf("build_transaction: failed to read length prefix from WASM memory")
 	}
 	dataLen := binary.LittleEndian.Uint32(lenBytes)
 
-	// Read BCS payload.
+	// Read the BCS payload, then free the entire buffer.
+	//
+	// CHANGED: free_bytes now expects the TOTAL allocation size (4 + dataLen),
+	// not just the payload length.  The Rust side allocates the header and
+	// payload in a single contiguous buffer; the allocator must be given the
+	// exact original size to correctly release the memory.
 	bcsData, ok := b.mod.Memory().Read(resPtr+4, dataLen)
-	callFn(b.ctx, b.mod, "free_bytes", uint64(resPtr), uint64(dataLen))
+	callFn(b.ctx, b.mod, "free_bytes", uint64(resPtr), uint64(4+dataLen))
 	if !ok {
-		return nil, fmt.Errorf("build_transaction: failed to read BCS payload")
+		return nil, fmt.Errorf(
+			"build_transaction: failed to read BCS payload (%d bytes) from WASM memory",
+			dataLen,
+		)
 	}
 
-	// Return a copy — WASM memory was freed above.
+	// Return a copy — WASM memory has been freed above.
 	out := make([]byte, len(bcsData))
 	copy(out, bcsData)
 	return out, nil

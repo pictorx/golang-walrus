@@ -2,26 +2,91 @@
 use crate::{TransactionBuilder, ObjectInput, Function, Argument};
 use crate::builder::ResolvedArgument;
 use sui_sdk_types::{Address, TypeTag, Identifier};
+use std::cell::RefCell;
 use std::slice;
 use std::mem;
 use std::str::FromStr;
 
-// ── Memory Management ────────────────────────────────────────────────────────
+// ── Thread-local error slot ───────────────────────────────────────────────────
 
-/// Allocate `len` bytes of WASM-linear memory for Go to write into.
-/// Free with `dealloc(ptr, len)`.
-#[no_mangle]
-pub extern "C" fn alloc(len: usize) -> *mut u8 {
-    let mut buf = Vec::<u8>::with_capacity(len);
-    let ptr = buf.as_mut_ptr();
-    mem::forget(buf);
-    ptr
+thread_local! {
+    /// Stores the last error message produced by any FFI call on this thread.
+    /// Cleared to None on any successful call that returns a meaningful value.
+    static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Free memory previously allocated by `alloc`.
+/// Record an error message into the thread-local slot.
+fn set_last_error(e: impl std::fmt::Display) {
+    LAST_ERROR.with(|cell| {
+        *cell.borrow_mut() = Some(e.to_string());
+    });
+}
+
+/// Clear the thread-local error slot after a successful operation.
+fn clear_last_error() {
+    LAST_ERROR.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// Return a pointer to the last error message (UTF-8, **not** null-terminated)
+/// and write its byte length into `*len_out`.
+///
+/// Returns NULL and sets `*len_out = 0` if no error has occurred since the last
+/// successful call.
+///
+/// The pointer is valid only until the **next** FFI call on the same thread.
+/// Do NOT pass it to `dealloc` or `free_bytes` — it is owned by the runtime.
+#[no_mangle]
+pub unsafe extern "C" fn last_error_message(len_out: *mut usize) -> *const u8 {
+    LAST_ERROR.with(|cell| {
+        match cell.borrow().as_ref() {
+            None => {
+                if !len_out.is_null() {
+                    *len_out = 0;
+                }
+                std::ptr::null()
+            }
+            Some(s) => {
+                if !len_out.is_null() {
+                    *len_out = s.len();
+                }
+                s.as_ptr()
+            }
+        }
+    })
+}
+
+// ── Memory Management ────────────────────────────────────────────────────────
+
+/// Allocate `len` bytes of memory for the caller to write into.
+/// Free with `dealloc(ptr, len)`.
+///
+/// Uses `std::alloc::alloc` directly so that capacity == len is an explicit
+/// invariant, making the matching `dealloc` safe regardless of future changes.
+#[no_mangle]
+pub extern "C" fn alloc(len: usize) -> *mut u8 {
+    if len == 0 {
+        // SAFETY: NonNull::dangling() is a valid non-null, non-zero pointer.
+        return std::ptr::NonNull::dangling().as_ptr();
+    }
+    // SAFETY: align=1 is always valid; len>0 checked above.
+    let layout = std::alloc::Layout::from_size_align(len, 1)
+        .expect("alloc: invalid layout");
+    unsafe { std::alloc::alloc(layout) }
+}
+
+/// Free memory previously allocated by `alloc(len)`.
+/// Calling with len=0 or a null pointer is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: usize) {
-    let _ = Vec::from_raw_parts(ptr, len, len);
+    if len == 0 || ptr.is_null() {
+        return;
+    }
+    // SAFETY: layout must exactly match the one used in `alloc`.
+    let layout = std::alloc::Layout::from_size_align(len, 1)
+        .expect("dealloc: invalid layout");
+    std::alloc::dealloc(ptr, layout);
 }
 
 // ── Builder Lifecycle ────────────────────────────────────────────────────────
@@ -66,9 +131,13 @@ pub unsafe extern "C" fn set_config(
             builder.set_sender(p.sender);
             if let Some(b) = p.gas_budget { builder.set_gas_budget(b); }
             if let Some(p) = p.gas_price  { builder.set_gas_price(p);  }
+            clear_last_error();
             1
         }
-        Err(_) => -1,
+        Err(e) => {
+            set_last_error(format!("set_config: {e}"));
+            -1
+        }
     }
 }
 
@@ -96,24 +165,37 @@ pub unsafe extern "C" fn add_gas_object(
         Ok(g) => {
             let digest = match sui_sdk_types::Digest::from_str(&g.digest) {
                 Ok(d)  => d,
-                Err(_) => return -2,
+                Err(e) => {
+                    set_last_error(format!("add_gas_object: invalid digest: {e}"));
+                    return -2;
+                }
             };
             builder.add_gas_objects(vec![ObjectInput::owned(g.id, g.version, digest)]);
+            clear_last_error();
             1
         }
-        Err(_) => -1,
+        Err(e) => {
+            set_last_error(format!("add_gas_object: {e}"));
+            -1
+        }
     }
 }
 
 // ── Gas pseudo-input ──────────────────────────────────────────────────────────
 
 /// Register (or retrieve) the gas-coin pseudo-input and return its Argument ID.
+///
 /// Idempotent — always returns the same ID within one builder.
 /// Pass this ID to `command_split_coins` or `command_move_call` wherever
 /// a gas-coin argument is needed.
+///
+/// Returns the Argument ID as an i64 (always ≥ 0; cannot fail).
+///
+/// CHANGED: return type is now `i64` (was `u64`) to be consistent with all
+/// other argument-returning FFI functions which use i64 with negative = error.
 #[no_mangle]
-pub unsafe extern "C" fn gas_argument(builder: *mut TransactionBuilder) -> u64 {
-    (&mut *builder).gas().id as u64
+pub unsafe extern "C" fn gas_argument(builder: *mut TransactionBuilder) -> i64 {
+    (&mut *builder).gas().id as i64
 }
 
 // ── Object inputs ─────────────────────────────────────────────────────────────
@@ -135,8 +217,10 @@ struct ObjectInputParams {
 ///   Owned/immutable/receiving: `{"id":"0x…","version":N,"digest":"…","kind":"owned"}`
 ///   Shared:                    `{"id":"0x…","version":N,"mutable":true,"kind":"shared"}`
 ///
-/// Returns Argument ID (≥ 0) on success, -1 on JSON error, -2 on bad digest,
-/// -3 on unknown kind.
+/// Returns Argument ID (≥ 0) on success, or:
+///   -1  JSON parse error
+///   -2  missing or invalid digest
+///   -3  unknown kind string
 #[no_mangle]
 pub unsafe extern "C" fn input_object(
     builder: *mut TransactionBuilder,
@@ -147,18 +231,27 @@ pub unsafe extern "C" fn input_object(
     let bytes = slice::from_raw_parts(json_ptr, json_len);
     let p: ObjectInputParams = match serde_json::from_slice(bytes) {
         Ok(v)  => v,
-        Err(_) => return -1,
+        Err(e) => {
+            set_last_error(format!("input_object: {e}"));
+            return -1;
+        }
     };
 
     let obj = match p.kind.as_str() {
         "owned" | "immutable" | "receiving" => {
             let digest_str = match &p.digest {
                 Some(d) => d,
-                None    => return -2,
+                None    => {
+                    set_last_error("input_object: 'digest' is required for owned/immutable/receiving");
+                    return -2;
+                }
             };
             let digest = match sui_sdk_types::Digest::from_str(digest_str) {
                 Ok(d)  => d,
-                Err(_) => return -2,
+                Err(e) => {
+                    set_last_error(format!("input_object: invalid digest: {e}"));
+                    return -2;
+                }
             };
             match p.kind.as_str() {
                 "owned"     => ObjectInput::owned(p.id, p.version, digest),
@@ -167,9 +260,13 @@ pub unsafe extern "C" fn input_object(
             }
         }
         "shared" => ObjectInput::shared(p.id, p.version, p.mutable.unwrap_or(true)),
-        _        => return -3,
+        _ => {
+            set_last_error(format!("input_object: unknown kind {:?}", p.kind));
+            return -3;
+        }
     };
 
+    clear_last_error();
     builder.object(obj).id as i64
 }
 
@@ -205,13 +302,20 @@ pub unsafe extern "C" fn pure_u64(builder: *mut TransactionBuilder, value: u64) 
     (&mut *builder).pure(&value).id as i64
 }
 
-/// Push a BCS-encoded `u128` pure argument supplied as two u64 halves
-/// (lo = low 64 bits, hi = high 64 bits). Returns Argument ID.
+/// Push a BCS-encoded `u128` pure argument supplied as two `u64` halves.
+///
+/// Argument order: `hi` = high 64 bits, `lo` = low 64 bits.
+/// Reconstructed value = `(hi << 64) | lo`.
+///
+/// Example — passing `u128::MAX`:
+///   `pure_u128(builder, u64::MAX, u64::MAX)`
+///
+/// Returns Argument ID.
 #[no_mangle]
 pub unsafe extern "C" fn pure_u128(
     builder: *mut TransactionBuilder,
-    lo: u64,
     hi: u64,
+    lo: u64,
 ) -> i64 {
     let value: u128 = ((hi as u128) << 64) | (lo as u128);
     (&mut *builder).pure(&value).id as i64
@@ -229,11 +333,20 @@ pub unsafe extern "C" fn pure_address(
     let bytes = slice::from_raw_parts(ptr, len);
     let s = match std::str::from_utf8(bytes) {
         Ok(s)  => s,
-        Err(_) => return -1,
+        Err(e) => {
+            set_last_error(format!("pure_address: invalid UTF-8: {e}"));
+            return -1;
+        }
     };
     match Address::from_str(s.trim().trim_matches('"')) {
-        Ok(addr) => (&mut *builder).pure(&addr).id as i64,
-        Err(_)   => -1,
+        Ok(addr) => {
+            clear_last_error();
+            (&mut *builder).pure(&addr).id as i64
+        }
+        Err(e) => {
+            set_last_error(format!("pure_address: {e}"));
+            -1
+        }
     }
 }
 
@@ -255,10 +368,15 @@ pub unsafe extern "C" fn pure_raw_bcs(
 /// command (e.g. the Kth coin from a SplitCoins with N amounts).
 ///
 /// - `base_id`   – Argument ID returned by `command_split_coins`.
+///                 Must refer to a command (not a plain input).
 /// - `sub_index` – 0-based index of the desired result (0 … N-1).
 ///
-/// Returns the new Argument ID.  Use it wherever a plain Argument ID is
-/// accepted (move_call, transfer_objects, etc.).
+/// Returns the new Argument ID (≥ 0) on success, or:
+///   -1  `base_id` does not refer to any known argument
+///   -2  `base_id` is a plain input, not a command result
+///
+/// Use the returned ID wherever a plain Argument ID is accepted
+/// (move_call, transfer_objects, etc.).
 #[no_mangle]
 pub unsafe extern "C" fn nested_result(
     builder: *mut TransactionBuilder,
@@ -266,9 +384,30 @@ pub unsafe extern "C" fn nested_result(
     sub_index: u64,
 ) -> i64 {
     let builder = &mut *builder;
-    let nested = Argument { id: base_id as usize, sub_index: Some(sub_index as usize) };
+    let base = base_id as usize;
+
+    // Validate that base_id was previously returned by a builder call.
+    if !builder.arguments.contains_key(&base) {
+        set_last_error(format!(
+            "nested_result: base_id {base_id} does not refer to a known argument"
+        ));
+        return -1;
+    }
+
+    // Validate that base_id is a command result, not a plain input.
+    // Only commands produce multi-value results that can be indexed by sub_index.
+    if !builder.commands.contains_key(&base) {
+        set_last_error(format!(
+            "nested_result: base_id {base_id} is a plain input, not a command result; \
+             sub_index is only valid on command outputs (e.g. from command_split_coins)"
+        ));
+        return -2;
+    }
+
+    let nested = Argument { id: base, sub_index: Some(sub_index as usize) };
     let new_id = builder.arguments.len();
     builder.arguments.insert(new_id, ResolvedArgument::ReplaceWith(nested));
+    clear_last_error();
     new_id as i64
 }
 
@@ -324,15 +463,24 @@ pub unsafe extern "C" fn command_move_call(
     let bytes = slice::from_raw_parts(json_ptr, json_len);
     let req: Req = match serde_json::from_slice(bytes) {
         Ok(r)  => r,
-        Err(_) => return -1,
+        Err(e) => {
+            set_last_error(format!("command_move_call: {e}"));
+            return -1;
+        }
     };
     let module = match Identifier::from_str(&req.module) {
         Ok(m)  => m,
-        Err(_) => return -2,
+        Err(e) => {
+            set_last_error(format!("command_move_call: invalid module identifier: {e}"));
+            return -2;
+        }
     };
     let function = match Identifier::from_str(&req.function) {
         Ok(f)  => f,
-        Err(_) => return -3,
+        Err(e) => {
+            set_last_error(format!("command_move_call: invalid function identifier: {e}"));
+            return -3;
+        }
     };
     let mut args = Vec::new();
     for a in req.arguments {
@@ -341,6 +489,7 @@ pub unsafe extern "C" fn command_move_call(
             CallArg::PureBcs { pure_bcs } => args.push(builder.pure_bytes(pure_bcs)),
         }
     }
+    clear_last_error();
     builder.move_call(
         Function::new(req.package, module, function).with_type_args(req.type_args),
         args,
@@ -351,13 +500,13 @@ pub unsafe extern "C" fn command_move_call(
 ///
 /// - `coin_arg_id`        – Argument ID of the coin to split (use `gas_argument`
 ///                          for the gas coin, or `input_object` for another coin).
-/// - `amount_arg_ids_ptr` – pointer to a C array of `count` uint64 values, each
-///                          an Argument ID returned by `pure_u64`.
+/// - `amount_arg_ids_ptr` – pointer to a C array of `count` i64 values, each an
+///                          Argument ID returned by `pure_u64`.
 /// - `count`              – number of amounts / result coins.
 ///
 /// Returns the **base** Argument ID shared by all result coins.
 /// Use `nested_result(base, 0)`, `nested_result(base, 1)`, … to address
-/// individual coins.
+/// individual result coins.
 ///
 /// Returns -1 if `count` is 0.
 #[no_mangle]
@@ -367,12 +516,20 @@ pub unsafe extern "C" fn command_split_coins(
     amount_arg_ids_ptr: *const u64,
     count: usize,
 ) -> i64 {
-    if count == 0 { return -1; }
+    if count == 0 {
+        set_last_error("command_split_coins: count must be > 0");
+        return -1;
+    }
     let builder = &mut *builder;
     let coin    = Argument::new(coin_arg_id as usize);
     let amounts = slice::from_raw_parts(amount_arg_ids_ptr, count)
         .iter().map(|&id| Argument::new(id as usize)).collect();
-    builder.split_coins(coin, amounts)[0].id as i64
+    // split_coins returns a Vec of Arguments that all share the same base `id`
+    // but have different sub_index values (0..count).  We return the base id
+    // so the caller can use nested_result(base, k) to address individual coins.
+    let results = builder.split_coins(coin, amounts);
+    clear_last_error();
+    results[0].id as i64
 }
 
 /// MergeCoins — merge `sources` into `target_coin_arg_id` (no result produced).
@@ -389,12 +546,16 @@ pub unsafe extern "C" fn command_merge_coins(
     source_arg_ids_ptr: *const u64,
     count: usize,
 ) -> i32 {
-    if count == 0 { return -1; }
+    if count == 0 {
+        set_last_error("command_merge_coins: count must be > 0");
+        return -1;
+    }
     let builder = &mut *builder;
     let target  = Argument::new(target_coin_arg_id as usize);
     let sources = slice::from_raw_parts(source_arg_ids_ptr, count)
         .iter().map(|&id| Argument::new(id as usize)).collect();
     builder.merge_coins(target, sources);
+    clear_last_error();
     1
 }
 
@@ -412,12 +573,16 @@ pub unsafe extern "C" fn command_transfer_objects(
     count: usize,
     recipient_arg_id: u64,
 ) -> i32 {
-    if count == 0 { return -1; }
+    if count == 0 {
+        set_last_error("command_transfer_objects: count must be > 0");
+        return -1;
+    }
     let builder  = &mut *builder;
     let objects  = slice::from_raw_parts(object_arg_ids_ptr, count)
         .iter().map(|&id| Argument::new(id as usize)).collect();
     let recipient = Argument::new(recipient_arg_id as usize);
     builder.transfer_objects(objects, recipient);
+    clear_last_error();
     1
 }
 
@@ -447,11 +612,17 @@ pub unsafe extern "C" fn command_make_move_vec(
         let bytes = slice::from_raw_parts(type_tag_ptr, type_tag_len);
         let s = match std::str::from_utf8(bytes) {
             Ok(s)  => s,
-            Err(_) => return -1,
+            Err(e) => {
+                set_last_error(format!("command_make_move_vec: invalid UTF-8 in type_tag: {e}"));
+                return -1;
+            }
         };
         match s.trim().parse::<TypeTag>() {
             Ok(t)  => Some(t),
-            Err(_) => return -2,
+            Err(e) => {
+                set_last_error(format!("command_make_move_vec: type_tag parse error: {e}"));
+                return -2;
+            }
         }
     };
 
@@ -462,6 +633,7 @@ pub unsafe extern "C" fn command_make_move_vec(
             .iter().map(|&id| Argument::new(id as usize)).collect()
     };
 
+    clear_last_error();
     builder.make_move_vec(type_tag, elements).id as i64
 }
 
@@ -490,8 +662,12 @@ pub unsafe extern "C" fn command_publish(
     let bytes = slice::from_raw_parts(json_ptr, json_len);
     let req: Req = match serde_json::from_slice(bytes) {
         Ok(r)  => r,
-        Err(_) => return -1,
+        Err(e) => {
+            set_last_error(format!("command_publish: {e}"));
+            return -1;
+        }
     };
+    clear_last_error();
     builder.publish(req.modules, req.dependencies).id as i64
 }
 
@@ -527,8 +703,12 @@ pub unsafe extern "C" fn command_upgrade(
     let bytes = slice::from_raw_parts(json_ptr, json_len);
     let req: Req = match serde_json::from_slice(bytes) {
         Ok(r)  => r,
-        Err(_) => return -1,
+        Err(e) => {
+            set_last_error(format!("command_upgrade: {e}"));
+            return -1;
+        }
     };
+    clear_last_error();
     builder.upgrade(
         req.modules,
         req.dependencies,
@@ -544,10 +724,12 @@ pub unsafe extern "C" fn command_upgrade(
 /// Returns a pointer to a heap buffer laid out as:
 ///   `[u32 payload_len (LE 4 bytes)][BCS bytes … payload_len bytes]`
 ///
-/// Free with `free_bytes(ptr, payload_len)` where `payload_len` is the u32
-/// read from the first 4 bytes.
+/// Free with `free_bytes(ptr, 4 + payload_len)` where `payload_len` is the
+/// u32 read from the first 4 bytes.
 ///
-/// Returns NULL on any build or serialisation error.
+/// Returns NULL on any build or serialisation error.  On NULL, call
+/// `last_error_message` to retrieve a human-readable description of what
+/// went wrong.
 ///
 /// IMPORTANT: this call consumes (drops) the builder.
 /// Do NOT call `free_builder` afterwards.
@@ -558,8 +740,15 @@ pub unsafe extern "C" fn build_transaction(builder: *mut TransactionBuilder) -> 
         bcs::to_bytes(&tx).map_err(|e| crate::error::Error::Input(e.to_string()))
     }) {
         Ok(b)  => b,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => {
+            set_last_error(format!("build_transaction: {e}"));
+            return std::ptr::null_mut();
+        }
     };
+
+    clear_last_error();
+
+    // Layout: [u32 LE payload_len][payload bytes]
     let total = 4 + payload.len();
     let mut buf = Vec::<u8>::with_capacity(total);
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -572,9 +761,15 @@ pub unsafe extern "C" fn build_transaction(builder: *mut TransactionBuilder) -> 
 }
 
 /// Free the buffer returned by `build_transaction`.
-/// Pass the u32 payload length read from the first 4 bytes as `payload_len`.
+///
+/// Pass `4 + payload_len` as `total_len`, where `payload_len` is the u32
+/// read from the first 4 bytes of the buffer.
 #[no_mangle]
-pub unsafe extern "C" fn free_bytes(ptr: *mut u8, payload_len: usize) {
-    let total = 4 + payload_len;
-    let _ = Vec::from_raw_parts(ptr, total, total);
+pub unsafe extern "C" fn free_bytes(ptr: *mut u8, total_len: usize) {
+    if total_len == 0 || ptr.is_null() {
+        return;
+    }
+    let layout = std::alloc::Layout::from_size_align(total_len, 1)
+        .expect("free_bytes: invalid layout");
+    std::alloc::dealloc(ptr, layout);
 }
