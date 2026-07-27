@@ -1,0 +1,31 @@
+[package]
+name = "walrus_bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "walrus_go_ffi"
+crate-type = ["staticlib"]
+
+[features]
+default = ["intents"]
+intents = ["dep:sui-rpc", "dep:async-trait"]
+
+[dependencies]
+walrus-sdk = { git = "https://github.com/mystenlabs/walrus.git", branch = "main", package = "walrus-sdk" }
+walrus-sui = { git = "https://github.com/mystenlabs/walrus.git", branch = "main", package = "walrus-sui" }
+walrus-core = { git = "https://github.com/mystenlabs/walrus.git", branch = "main", package = "walrus-core" }
+
+tokio  = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time"] }
+anyhow = "1.0"
+serde  = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+zeroize = { version = "1", features = ["derive"] }
+
+bcs = "0.1"
+thiserror = "2.0"
+# Sui transaction builder dependencies
+sui-sdk-types = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", tag = "sui-rpc-0.2.2", features = ["serde", "hash"] }
+sui-rpc = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", tag = "sui-rpc-0.2.2", optional = true }
+async-trait = { version = "0.1.89", optional = true }

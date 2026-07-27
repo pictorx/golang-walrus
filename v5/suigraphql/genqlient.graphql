@@ -1,0 +1,27 @@
+query getDynamicFields($id: SuiAddress!) {
+  address(address: $id) {
+    dynamicFields {
+      nodes {
+        name { ...Value }
+        value {
+          __typename
+          ... on MoveValue {
+            ...Value
+          }
+          ... on MoveObject {
+            contents {
+              ...Value
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fragment Value on MoveValue {
+  type {
+    repr
+  }
+  json
+}
