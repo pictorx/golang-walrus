@@ -3,13 +3,12 @@ package main
 import (
 	"context"
 
-	"encoding/json"
 	"fmt"
-	"golang-walrus/v5/suigraphql"
 	"log"
 
-	"github.com/Khan/genqlient/graphql"
 	"github.com/block-vision/sui-go-sdk/signer"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 const (
@@ -17,7 +16,7 @@ const (
 )
 
 func main() {
-	_, err := signer.NewSignerWithSecretKey("")
+	acc, err := signer.NewSignerWithSecretKey("")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -31,20 +30,24 @@ func main() {
 
 	ctx := context.Background()
 
-	poolBlobObjects, err := GetStoragePoolBlobObjects(
+	/*poolBlobObjects, err := GetStoragePoolBlobObjects(
 		ctx, TestnetConfig.GraphQLEndpoint,
 		"0x15270e9746c8c4085d6b5d3915f5d26e605dc38136e94813a8d064c169bad5a2",
-	)
+	)*/
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	//fmt.Println(poolBlobObjects)
+	conn, err := grpc.Dial(TestnetConfig.GRPCEndpoint, grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
+	if err != nil {
+		log.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
 
-	poolBlobObjectTableID, ok := poolBlobObjects["id"].(string)
+	/*poolBlobObjectTableID, ok := poolBlobObjects["id"].(string)
 	if !ok {
 		log.Fatal("poolBlobObjectTableID is not a string")
-	}
+	}*/
 
 	/* randomSuffix := make([]byte, 8)
 	rand.Read(randomSuffix)
@@ -55,7 +58,7 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Println(blob)*/
-	client_graph := graphql.NewClient(TestnetConfig.GraphQLEndpoint, gqlHTTPClient)
+	/*client_graph := graphql.NewClient(TestnetConfig.GraphQLEndpoint, gqlHTTPClient)
 
 	resp, err := suigraphql.GetDynamicFields(ctx, client_graph, poolBlobObjectTableID)
 	if err != nil {
@@ -82,6 +85,24 @@ func main() {
 		movObjs = append(movObjs, meta)
 	}
 
-	fmt.Println(movObjs)
+	fmt.Println(movObjs)*/
 
+	gasPrice, err := GetGas(conn, ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	price := gasPrice.Epoch.ReferenceGasPrice
+	add, err := AddPooledBlobMetadata(
+		conn,
+		TestnetConfig,
+		ctx, acc, "0x15270e9746c8c4085d6b5d3915f5d26e605dc38136e94813a8d064c169bad5a2",
+		BlobIDToBase64("80392606948090037230430042512468532838133279124717429954941529119024196032378"), "filename", "file.bin",
+		100_000_000, *price,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(add)
 }

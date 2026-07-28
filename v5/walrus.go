@@ -11,11 +11,11 @@ package main
 */
 import "C"
 import (
-		"encoding/binary"
 	"context"
 	"crypto/rand"
 	_ "embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -33,6 +33,7 @@ import (
 
 	"github.com/Khan/genqlient/graphql"
 	"github.com/block-vision/sui-go-sdk/constant"
+	"github.com/block-vision/sui-go-sdk/models"
 	"github.com/block-vision/sui-go-sdk/signer"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
@@ -89,6 +90,7 @@ type NetworkConfig struct {
 	WalrusPooledBlobObjectType string
 	// WalrusStakingObject is the on-chain object ID used to query epoch info.
 	WalrusStakingObject string
+	WalrusSystemObject  string
 	WalrusCoinObject    string
 	SuiCoinObject       string
 }
@@ -101,6 +103,7 @@ var TestnetConfig = NetworkConfig{
 	WalrusStoragePoolObjectType: "0xd84704c17fc870b8764832c535aa6b11f21a95cd6f5bb38a9b07d2cf42220c66::storage_pool::StoragePool",
 	WalrusPooledBlobObjectType:  "0xd84704c17fc870b8764832c535aa6b11f21a95cd6f5bb38a9b07d2cf42220c66::storage_pool::PooledBlob",
 	WalrusStakingObject:         "0xbe46180321c30aab2f8b3501e24048377287fa708018a5b7c2792b35fe339ee3",
+	WalrusSystemObject:          "0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af",
 	WalrusCoinObject:            "0x8270feb7375eee355e64fdb69c50abb6b5f9393a722883c1cf45f8e26048810a::wal::WAL",
 	SuiCoinObject:               "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI",
 }
@@ -113,6 +116,7 @@ var MainnetConfig = NetworkConfig{
 	WalrusStoragePoolObjectType: "0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::storage_pool::StoragePool",
 	WalrusPooledBlobObjectType:  "0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::storage_pool::PooledBlob",
 	WalrusStakingObject:         "0x10b9d30c28448939ce6c4d6c6e0ffce4a7f8a4ada8248bdad09ef8b70e4a3904",
+	WalrusSystemObject:          "0x2134d52768ea07e8c43570ef975eb3e4c27a39fa6396bef985b5abc58d03ddd2",
 	WalrusCoinObject:            "0x356a26eb9e012a68958082340d4c4116e7f55615cf27affcff209cf0ae544f59::wal::WAL",
 	SuiCoinObject:               "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI",
 }
@@ -1762,7 +1766,7 @@ type Builder struct {
 // NewBuilder instantiates a fresh TransactionBuilder inside the static library.
 // The ctx parameter is accepted for API compatibility with the WASM version
 // but is not used — native calls are synchronous.
-func NewBuilder(_ interface{}, _ interface{}) *Builder {
+func NewBuilder() *Builder {
 	return &Builder{ptr: C.new_builder()}
 }
 
@@ -2142,4 +2146,451 @@ func goU64SliceCopy(ids []uint64) (*C.uint64_t, C.size_t) {
 		binary.LittleEndian.PutUint64(dst[i*8:], v)
 	}
 	return (*C.uint64_t)(ptr), C.size_t(len(ids))
+}
+
+func GetObject(conn *grpc.ClientConn, objectId string, version *uint64, ctx context.Context) (*generated.GetObjectResponse, error) {
+	client := generated.NewLedgerServiceClient(conn)
+	resp, err := client.GetObject(ctx, &generated.GetObjectRequest{
+		ObjectId: &objectId,
+		Version:  version,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, err
+}
+
+func ListOwnedObjects(conn *grpc.ClientConn, owner string, pagesize *uint32, pagetoken []byte, ctx context.Context) (*generated.ListOwnedObjectsResponse, error) {
+	client := generated.NewStateServiceClient(conn)
+	resp, err := client.ListOwnedObjects(ctx, &generated.ListOwnedObjectsRequest{
+		Owner:     &owner,
+		PageSize:  pagesize,
+		PageToken: pagetoken,
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func ListDynamicFields(conn *grpc.ClientConn, objectId string, pagesize *uint32, pagetoken []byte, ctx context.Context) (*generated.ListDynamicFieldsResponse, error) {
+	client := generated.NewStateServiceClient(conn)
+	resp, err := client.ListDynamicFields(ctx, &generated.ListDynamicFieldsRequest{
+		Parent:    &objectId,
+		PageSize:  pagesize,
+		PageToken: pagetoken,
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func OwnedCoins(listownedobjects *generated.ListOwnedObjectsResponse, cointype, owner string) []*generated.Object {
+	list := listownedobjects
+
+	var coins []*generated.Object
+	for _, v := range list.GetObjects() {
+
+		if *v.ObjectType == cointype {
+
+			coins = append(coins, v)
+		}
+	}
+
+	return coins
+}
+
+type Coin struct {
+	Type string
+}
+
+func (c *Coin) String() string {
+	prefix := "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin"
+	return prefix + "<" + c.Type + ">"
+}
+
+var SuiCoin Coin = Coin{
+	Type: "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI",
+}
+
+var schemeMap = map[byte]generated.SignatureScheme{
+	0x00: generated.SignatureScheme_ED25519,
+	0x01: generated.SignatureScheme_SECP256K1,
+	0x02: generated.SignatureScheme_SECP256R1,
+}
+
+func SignExecuteTransaction(conn *grpc.ClientConn, txBytes, signature []byte, ctx context.Context) (*generated.ExecuteTransactionResponse, error) {
+	// The serialized signature format is: [flag: 1 byte][sig: 64 bytes][pubkey: 32 bytes]
+	if len(signature) != 97 {
+		return nil, fmt.Errorf("invalid signature length: expected 97, got %d", len(signature))
+	}
+
+	// Extract components
+	flagByte := signature[0]        // Should be 0x00 for Ed25519
+	sigBytes := signature[1:65]     // 64-byte signature
+	pubKeyBytes := signature[65:97] // 32-byte public key
+
+	scheme, exists := schemeMap[flagByte]
+	if !exists {
+		return nil, fmt.Errorf("Unsupported signature scheme flag: 0x%02x", flagByte)
+	}
+
+	client := generated.NewTransactionExecutionServiceClient(conn)
+	resp, err := client.ExecuteTransaction(ctx, &generated.ExecuteTransactionRequest{
+		Transaction: &generated.Transaction{
+			Bcs: &generated.Bcs{Value: txBytes},
+		},
+		Signatures: []*generated.UserSignature{
+			{
+				Scheme: scheme.Enum(),
+				Signature: &generated.UserSignature_Simple{
+					Simple: &generated.SimpleSignature{
+						Scheme:    scheme.Enum(),
+						Signature: sigBytes,
+						PublicKey: pubKeyBytes,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func GetGas(conn *grpc.ClientConn, ctx context.Context) (*generated.GetEpochResponse, error) {
+	client := generated.NewLedgerServiceClient(conn)
+	resp, err := client.GetEpoch(ctx, &generated.GetEpochRequest{})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func SimulateTransaction(conn *grpc.ClientConn, txBytes []byte, ctx context.Context) (*generated.SimulateTransactionResponse, error) {
+	client := generated.NewTransactionExecutionServiceClient(conn)
+	resp, err := client.SimulateTransaction(ctx, &generated.SimulateTransactionRequest{
+		Transaction: &generated.Transaction{
+			Bcs: &generated.Bcs{Value: txBytes},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// Helper function to extract estimated budget from simulation response
+func EstimateGasBudget(resp *generated.SimulateTransactionResponse) (uint64, error) {
+	effects := resp.Transaction.GetEffects()
+	if !effects.GetStatus().GetSuccess() {
+		return 0, fmt.Errorf("simulation failed: %s", effects.GetStatus().GetError())
+	}
+
+	gasUsed := effects.GetGasUsed()
+
+	// Budget must cover Computation + Storage
+	// We do NOT subtract the rebate here; the rebate is a refund applied *after* execution.
+	estimatedCost := gasUsed.GetComputationCost() + gasUsed.GetStorageCost()
+
+	// Add a small safety buffer (e.g., 5-10%) just to be safe against slight network fluctuations
+	// 2.97M becomes ~3.1M
+	buffer := estimatedCost / 10
+	finalBudget := estimatedCost + buffer
+
+	return finalBudget, nil
+}
+
+func FindCoins(ctx context.Context, network NetworkConfig, conn *grpc.ClientConn, owner string) (gas *generated.Object, wal *generated.Object, err error) {
+	// We iterate owned objects to find one SUI coin and one WAL coin
+	// In production, you'd want to merge coins if balances are too small.
+	resp, err := ListOwnedObjects(conn, owner, nil, nil, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	gasCoin := SuiCoin
+	walCoin := Coin{
+		Type: network.WalrusCoinObject,
+	}
+
+	for _, obj := range resp.Objects {
+		if gas == nil && *obj.ObjectType == gasCoin.String() {
+			gas = obj
+		}
+		if wal == nil && *obj.ObjectType == walCoin.String() {
+			wal = obj
+		}
+		if gas != nil && wal != nil {
+			break
+		}
+	}
+
+	if gas == nil {
+		return nil, nil, fmt.Errorf("no SUI gas coin found")
+	}
+	if wal == nil {
+		return nil, nil, fmt.Errorf("no WAL coin found")
+	}
+	gas_coin, err := GetObject(conn, *gas.ObjectId, gas.Version, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	wal_coin, err := GetObject(conn, *wal.ObjectId, wal.Version, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return gas_coin.Object, wal_coin.Object, nil
+}
+
+type WalSystem struct {
+	PackageID string
+	Owner     uint64
+}
+
+func GetWalSystem(conn *grpc.ClientConn, network NetworkConfig, ctx context.Context) (*WalSystem, error) {
+	client := generated.NewLedgerServiceClient(conn)
+	address := network.WalrusSystemObject
+	resp, err := client.GetObject(ctx, &generated.GetObjectRequest{
+		ObjectId: &address,
+		Version:  nil,
+		ReadMask: &fieldmaskpb.FieldMask{
+			Paths: []string{"json", "owner"}, // ← owner.shared.initial_shared_version
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	raw, ok := resp.Object.Json.AsInterface().(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("object %s: JSON is not a map", address)
+	}
+
+	w := WalSystem{
+		PackageID: raw["package_id"].(string),
+		Owner:     resp.Object.Owner.GetVersion(),
+	}
+
+	return &w, nil
+}
+
+func encodeVectorU8(data []byte) []byte {
+	// Encode length as ULEB128
+	var lengthBytes []byte
+	length := uint64(len(data))
+
+	for {
+		byte := uint8(length & 0x7f)
+		length >>= 7
+		if length != 0 {
+			byte |= 0x80 // Set continuation bit
+		}
+		lengthBytes = append(lengthBytes, byte)
+		if length == 0 {
+			break
+		}
+	}
+
+	// Return length + data
+	result := make([]byte, 0, len(lengthBytes)+len(data))
+	result = append(result, lengthBytes...)
+	result = append(result, data...)
+	return result
+}
+
+func submitWithRetry(
+	conn *grpc.ClientConn,
+	txBytes, sigRaw []byte,
+	ctx context.Context,
+) (*generated.ExecuteTransactionResponse, error) {
+	const maxAttempts = 4
+	backoff := 2 * time.Second
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := SignExecuteTransaction(conn, txBytes, sigRaw, ctx)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if attempt == maxAttempts {
+			break
+		}
+		/*log.Printf("submit attempt %d/%d failed: %v — retrying in %v",
+		  attempt, maxAttempts, err, backoff)*/
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled while waiting to retry: %w", ctx.Err())
+		}
+		backoff *= 2
+	}
+	return nil, fmt.Errorf("all %d submit attempts failed, last error: %w", maxAttempts, lastErr)
+}
+
+// SignedTx holds everything needed to submit a transaction.
+type SignedTx struct {
+	// TxBytes is the base64-encoded BCS transaction — pass as the first
+	// argument to sui_executeTransactionBlock.
+	TxBytes string
+
+	// Signature is the serialized Ed25519 signature — pass in the
+	// "signatures" array to sui_executeTransactionBlock.
+	// Format: base64( 0x00 | sig[64] | pubkey[32] )
+	Signature string
+}
+
+// SignTransaction signs rawBCS (the []byte returned by builder.Build())
+// with the private key derived from the given BIP-39 mnemonic.
+//
+// The mnemonic must be the 12- or 24-word phrase for the Sui account
+// whose address matches the sender set in the transaction.
+//
+// Only Ed25519 keys are supported by this helper; for Secp256k1 use
+// signer.NewSignerWithPrivateKey with a Secp256k1 key directly.
+func SignTransaction(rawBCS []byte, account *signer.Signer) (*SignedTx, error) {
+	// ── 1. Wrap raw BCS in TxnMetaData ────────────────────────────────────
+	// TxnMetaData.TxBytes must be standard base64 (not URL-safe, no padding
+	// stripped).  The SDK decodes it before intent-wrapping and hashing.
+	txMeta := models.TxnMetaData{
+		TxBytes: base64.StdEncoding.EncodeToString(rawBCS),
+	}
+
+	// ── 2. Sign ───────────────────────────────────────────────────────────
+	// SignSerializedSigWith internally:
+	//   a. base64-decodes TxBytes
+	//   b. prepends the 3-byte transaction intent [0, 0, 0]
+	//   c. computes blake2b-256 of the intent message
+	//   d. signs the hash with ed25519
+	//   e. serialises: base64(flagByte=0x00 | signature[64] | pubKey[32])
+	signed := txMeta.SignSerializedSigWith(account.PriKey)
+
+	return &SignedTx{
+		TxBytes:   signed.TxBytes,
+		Signature: signed.Signature,
+	}, nil
+}
+
+// AddPooledBlobMetadata sets (creates or updates) a single metadata key/value
+// pair on a PooledBlob. Mirrors CertifyBlob's exact shape in sui.go: same
+// NewBuilder()/SetConfig/AddGasObject/InputObject/MoveCall/Build/SignTransaction/
+// submitWithRetry sequence, same GetWalSystem-based package lookup — storage_pool
+// is a module in the same walrus package as system/blob/metadata, so
+// wal_system.PackageID is the right package id here too, not a separate one.
+func AddPooledBlobMetadata(
+	conn *grpc.ClientConn, network NetworkConfig, ctx context.Context,
+	acc *signer.Signer,
+	storagePoolObjectID string, blobIDBase64 string,
+	key, value string,
+	gasBudget, gasPrice uint64,
+) (*generated.ExecuteTransactionResponse, error) {
+	b := NewBuilder()
+	defer b.Free() // no-op once Build() succeeds — safe on an already-freed builder
+
+	if err := b.SetConfig(acc.Address, gasBudget, gasPrice); err != nil {
+		return nil, fmt.Errorf("set config: %w", err)
+	}
+
+	gasCoin, _, err := FindCoins(ctx, network, conn, acc.Address)
+	if err != nil {
+		return nil, fmt.Errorf("find gas coin: %w", err)
+	}
+	if err := b.AddGasObject(*gasCoin.ObjectId, uint64(*gasCoin.Version), *gasCoin.Digest); err != nil {
+		return nil, fmt.Errorf("add gas object: %w", err)
+	}
+
+	wal_system, err := GetWalSystem(conn, network, ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get wal system: %w", err)
+	}
+
+	poolVersion, poolDigest, err := fetchStoragePoolVersionAndDigest(conn, ctx, storagePoolObjectID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch storage pool version/digest: %w", err)
+	}
+	poolArg, err := b.InputObject(storagePoolObjectID, poolVersion, poolDigest, ObjectKindOwned, true) // &mut StoragePool
+	if err != nil {
+		return nil, fmt.Errorf("input storage pool object: %w", err)
+	}
+
+	// blob_id as Move u256 — 32 raw little-endian bytes, same wire layout as
+	// BlobId itself. Passed via PureRawBCS same as blobIdArg elsewhere in
+	// this file — not run through encodeVectorU8, since that helper is for
+	// vector<u8> (length-prefixed), and u256 is a fixed-size value with no
+	// length prefix.
+	blobIDBytes, err := base64.RawURLEncoding.DecodeString(blobIDBase64)
+	if err != nil {
+		return nil, fmt.Errorf("decode blob_id: %w", err)
+	}
+	if len(blobIDBytes) != 32 {
+		return nil, fmt.Errorf("blob_id must decode to 32 bytes, got %d", len(blobIDBytes))
+	}
+	blobIDArg := b.PureRawBCS(blobIDBytes)
+
+	// String args DO need the vector<u8> length prefix — same encodeVectorU8
+	// already used for key/value in the owned-blob metadata path above.
+	keyArg := b.PureRawBCS(encodeVectorU8([]byte(key)))
+	valueArg := b.PureRawBCS(encodeVectorU8([]byte(value)))
+
+	_, err = b.MoveCall(
+		wal_system.PackageID,
+		"storage_pool",
+		"insert_or_update_blob_metadata_pair",
+		[]string{},
+		[]MoveCallArg{
+			ArgID(poolArg),
+			ArgID(blobIDArg),
+			ArgID(keyArg),
+			ArgID(valueArg),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("insert_or_update_blob_metadata_pair move call: %w", err)
+	}
+
+	txBytes, err := b.Build()
+	if err != nil {
+		return nil, fmt.Errorf("build transaction: %w", err)
+	}
+
+	signed, err := SignTransaction(txBytes, acc)
+	if err != nil {
+		return nil, fmt.Errorf("sign transaction: %w", err)
+	}
+
+	sigRaw, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return nil, fmt.Errorf("decode signature: %w", err)
+	}
+
+	return submitWithRetry(conn, txBytes, sigRaw, ctx)
+}
+
+// fetchStoragePoolVersionAndDigest returns a StoragePool object's own
+// current version and digest — StoragePool is owned (has key, store in the
+// Move struct), not shared, so an owned-object input needs both, not just
+// a version.
+func fetchStoragePoolVersionAndDigest(conn *grpc.ClientConn, ctx context.Context, objectID string) (uint64, string, error) {
+	client := generated.NewLedgerServiceClient(conn)
+	resp, err := client.GetObject(ctx, &generated.GetObjectRequest{
+		ObjectId: &objectID,
+		Version:  nil,
+		ReadMask: &fieldmaskpb.FieldMask{
+			Paths: []string{"version", "digest"},
+		},
+	})
+
+	if err != nil {
+		return 0, "", err
+	}
+	return resp.Object.GetVersion(), resp.Object.GetDigest(), nil
 }
