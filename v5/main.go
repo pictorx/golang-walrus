@@ -1,14 +1,14 @@
 package main
 
 import (
+	// "context"
+
 	"context"
-
 	"fmt"
-	"log"
-
 	"github.com/block-vision/sui-go-sdk/signer"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
+	"log"
+	// "google.golang.org/grpc"
+	// "google.golang.org/grpc/credentials"
 )
 
 const (
@@ -30,24 +30,11 @@ func main() {
 
 	ctx := context.Background()
 
-	/*poolBlobObjects, err := GetStoragePoolBlobObjects(
-		ctx, TestnetConfig.GraphQLEndpoint,
-		"0x15270e9746c8c4085d6b5d3915f5d26e605dc38136e94813a8d064c169bad5a2",
-	)*/
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	conn, err := grpc.Dial(TestnetConfig.GRPCEndpoint, grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
+	/*conn, err := grpc.Dial(TestnetConfig.GRPCEndpoint, grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
 	if err != nil {
 		log.Fatalf("Failed to dial: %v", err)
 	}
-	defer conn.Close()
-
-	/*poolBlobObjectTableID, ok := poolBlobObjects["id"].(string)
-	if !ok {
-		log.Fatal("poolBlobObjectTableID is not a string")
-	}*/
+	defer conn.Close()*/
 
 	/* randomSuffix := make([]byte, 8)
 	rand.Read(randomSuffix)
@@ -58,36 +45,8 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Println(blob)*/
-	/*client_graph := graphql.NewClient(TestnetConfig.GraphQLEndpoint, gqlHTTPClient)
 
-	resp, err := suigraphql.GetDynamicFields(ctx, client_graph, poolBlobObjectTableID)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	nodes := resp.Address.GetDynamicFields().Nodes
-
-	if len(nodes) == 0 {
-		log.Fatal("no dynamic fields")
-	}
-	var movObjs []map[string]any
-	for i := range nodes {
-		moveObj, err := nodes[i].MarshalJSON()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		var meta map[string]any
-		if err := json.Unmarshal(moveObj, &meta); err != nil {
-			log.Fatal(err)
-		}
-
-		movObjs = append(movObjs, meta)
-	}
-
-	fmt.Println(movObjs)*/
-
-	gasPrice, err := GetGas(conn, ctx)
+	/*gasPrice, err := GetGas(conn, ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -102,7 +61,45 @@ func main() {
 	)
 	if err != nil {
 		log.Fatal(err)
+	}*/
+
+	/*estimate, err := EstimateEncodedSize(39, 1000, "RS2")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Metadata: %d\nData: %d\nEncoded: %d\n", estimate.MetadataSize, estimate.DataSize, estimate.TotalEncodedSize)
+	*/
+
+	pooledBlobs, err := GetStoragePoolBlobObjects(
+		ctx, TestnetConfig.GraphQLEndpoint,
+		"0x15270e9746c8c4085d6b5d3915f5d26e605dc38136e94813a8d064c169bad5a2")
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	fmt.Println(add)
+	//fmt.Println(pooledBlobs)
+
+	/*getPooledBlob, err := ReadBlob(BlobIDToBase64(pooledBlobs[0]["blob_id"].(string)), acc)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(string(getPooledBlob))*/
+
+	var pooledBlobsId []string
+	for i := range pooledBlobs {
+		pooledBlobsId = append(pooledBlobsId, BlobIDToBase64(pooledBlobs[i]["blob_id"].(string)))
+	}
+
+	getPooledBlobs, err := ReadBlobs(pooledBlobsId, acc)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for i := range getPooledBlobs {
+		b := getPooledBlobs[i]
+		if b.Err == nil {
+			fmt.Println(string(b.Data))
+		}
+	}
+
 }

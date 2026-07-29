@@ -1785,3 +1785,116 @@ pub extern "C" fn walrus_storage_pool_status(config_json: *const c_char) -> *mut
         Err(e) => err_ptr(format!("{e:#}")),
     }
 }
+
+use walrus_core::EncodingType;
+
+// ── Encoded Size Estimation (pure computation, no network/signing needed) ───
+//
+// Lets a caller estimate a blob's on-chain encoded footprint — split into
+// metadata vs. sliver ("data") bytes — BEFORE uploading anything. Useful for
+// warning users when a small file is about to pay disproportionate fixed
+// overhead (see the metadata_length_for_n_shards term below: it scales with
+// n_shards, not with the file), or for deciding whether a file is a
+// candidate for quilting instead of a standalone blob.
+//
+// n_shards is a required input, not fetched automatically — this function
+// does no network I/O on purpose (call it instantly, repeatedly, client-side,
+// e.g. as the user picks a file). Fetch n_shards from the committee
+// (GetWalSystem or equivalent) at whatever cadence makes sense for you —
+// it's effectively static today (1000 on both testnet and mainnet) but
+// treat it as data, not a hardcoded constant, in case that ever changes.
+
+#[derive(Debug, Deserialize)]
+struct EstimateEncodedSizeConfig {
+    unencoded_length: u64,
+    n_shards: u16,
+    /// Optional — only "RS2" exists today (walrus_core::DEFAULT_ENCODING).
+    /// Left as a string so this stays forward-compatible if a second
+    /// encoding type is ever added.
+    encoding_type: Option<EncodingType>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum EstimateEncodedSizeResult {
+    Ok {
+        /// Bytes of per-shard metadata (two hashes per shard, replicated
+        /// across every shard) — this is the term that dominates for
+        /// small files and does NOT shrink as file size shrinks.
+        metadata_size: u64,
+        /// Bytes of actual erasure-coded content ("sliver") data across
+        /// all shards — this is the term that scales with file size.
+        data_size: u64,
+        /// metadata_size + data_size — what StoragePool capacity /
+        /// registration on-chain actually accounts against.
+        total_encoded_size: u64,
+    },
+    Err {
+        error: String,
+    },
+}
+
+fn estimate_encoded_size(
+    config: EstimateEncodedSizeConfig,
+) -> anyhow::Result<EstimateEncodedSizeResult> {
+    let n_shards = std::num::NonZeroU16::new(config.n_shards)
+        .context("n_shards must be non-zero")?;
+    let encoding_type = config.encoding_type.unwrap_or(walrus_core::DEFAULT_ENCODING);
+
+    let data_size = walrus_core::encoding::encoded_slivers_length_for_n_shards(
+        n_shards,
+        config.unencoded_length,
+        encoding_type,
+    )
+    .context("compute encoded slivers length — check unencoded_length isn't larger than this encoding supports")?;
+
+    let metadata_size =
+        u64::from(n_shards.get()) * walrus_core::encoding::metadata_length_for_n_shards(n_shards);
+
+    Ok(EstimateEncodedSizeResult::Ok {
+        metadata_size,
+        data_size,
+        total_encoded_size: metadata_size + data_size,
+    })
+}
+
+/// Estimates the on-chain encoded size of a blob BEFORE uploading it, split
+/// into metadata bytes vs. data (sliver) bytes. Pure computation — no
+/// network calls, no signing, safe to call as often as you like.
+///
+/// config_json: {
+///   "unencoded_length": 39,
+///   "n_shards":         1000,
+///   "encoding_type":    "RS2"     ← optional, defaults to RS2
+/// }
+///
+/// Returns JSON:
+///   success: {"metadata_size":64032000,"data_size":2002000,"total_encoded_size":66034000}
+///   failure: {"error":"…"}
+///
+/// MUST be freed with walrus_free_string().
+#[no_mangle]
+pub extern "C" fn walrus_estimate_encoded_size(config_json: *const c_char) -> *mut c_char {
+    let config_str = unsafe {
+        match CStr::from_ptr(config_json).to_str() {
+            Ok(s) => s,
+            Err(e) => return err_ptr(format!("invalid config UTF-8: {e}")),
+        }
+    };
+    let config: EstimateEncodedSizeConfig = match serde_json::from_str(config_str) {
+        Ok(c) => c,
+        Err(e) => return err_ptr(format!("config parse error: {e}")),
+    };
+
+    let result = match estimate_encoded_size(config) {
+        Ok(r) => r,
+        Err(e) => return err_ptr(format!("{e:#}")),
+    };
+
+    let json = serde_json::to_string(&result)
+        .unwrap_or_else(|_| r#"{"error":"internal serialization error"}"#.to_string());
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new(r#"{"error":"internal error"}"#).unwrap())
+        .into_raw()
+}
+

@@ -726,6 +726,31 @@ uint8_t *build_transaction(TransactionBuilder *builder);
  */
 void free_bytes(uint8_t *ptr, size_t payload_len);
 
+/**
+ * Estimates the on-chain encoded size of a blob BEFORE uploading it, split
+ * into metadata bytes vs. data (sliver) bytes. Pure computation — no
+ * network calls, no signing, safe to call as often as you like (e.g. as
+ * soon as the user picks a file, before any upload begins).
+ *
+ * config_json – UTF-8 JSON:
+ *   {
+ *     "unencoded_length": 39,
+ *     "n_shards":         1000,
+ *     "encoding_type":    "RS2"     ← optional, defaults to RS2
+ *   }
+ *
+ * Returns a heap-allocated C string with JSON:
+ *   success: {"metadata_size":64032000,"data_size":2002000,"total_encoded_size":66034000}
+ *   failure: {"error":"…"}
+ *
+ * metadata_size scales with n_shards, not with unencoded_length — it's the
+ * fixed cost that makes small blobs disproportionately expensive on-chain.
+ * data_size is the part that actually scales with the input size.
+ *
+ * MUST be freed with walrus_free_string().
+ */
+char* walrus_estimate_encoded_size(const char* config_json);
+
 #ifdef __cplusplus
 }
 #endif

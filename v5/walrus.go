@@ -1634,7 +1634,7 @@ func GetAllStoragePools(
 	return allObjects, nil
 }
 
-func GetStoragePoolBlobObjects(ctx context.Context, graphqlEndpoint, storage_pool string) (map[string]any, error) {
+func GetStoragePoolBlobObjects(ctx context.Context, graphqlEndpoint, storage_pool string) ([]map[string]any, error) {
 	client := graphql.NewClient(graphqlEndpoint, gqlHTTPClient)
 	resp, err := suigraphql.GetDynamicFields(ctx, client, storage_pool)
 	if err != nil {
@@ -1657,7 +1657,37 @@ func GetStoragePoolBlobObjects(ctx context.Context, graphqlEndpoint, storage_poo
 		return nil, fmt.Errorf("pooledObjectsTable missing or wrong type")
 	}
 
-	return pooledObjectsTable, nil
+	poolBlobObjectTableID, ok := pooledObjectsTable["id"].(string)
+	if !ok {
+		return nil, fmt.Errorf("poolBlobObjectTableID is not a string")
+	}
+
+	resp2, err := suigraphql.GetDynamicFields(ctx, client, poolBlobObjectTableID)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes2 := resp2.Address.GetDynamicFields().Nodes
+
+	if len(nodes2) == 0 {
+		return nil, fmt.Errorf("no dynamic fields")
+	}
+	var movObjs []map[string]any
+	for i := range nodes2 {
+		moveObj, err := nodes2[i].MarshalJSON()
+		if err != nil {
+			return nil, err
+		}
+
+		var meta map[string]any
+		if err := json.Unmarshal(moveObj, &meta); err != nil {
+			return nil, err
+		}
+
+		movObjs = append(movObjs, meta["value"].(map[string]any)["contents"].(map[string]any)["json"].(map[string]any))
+	}
+
+	return movObjs, nil
 }
 
 // GetStoragePoolStatus returns a storage pool's current capacity
@@ -1753,6 +1783,56 @@ func BurnExpiredBlobs(privKey *signer.Signer) (int, error) {
 		return 0, fmt.Errorf("walrus error: %s", result.Error)
 	}
 	return result.Burned, nil
+}
+
+// EncodedSizeEstimate breaks down a blob's on-chain encoded footprint —
+// metadata_size scales with n_shards (the fixed, per-shard-replicated cost
+// that makes small files disproportionately expensive); data_size scales
+// with the actual content length.
+type EncodedSizeEstimate struct {
+	MetadataSize     uint64 `json:"metadata_size"`
+	DataSize         uint64 `json:"data_size"`
+	TotalEncodedSize uint64 `json:"total_encoded_size"`
+}
+
+// EstimateEncodedSize computes a blob's on-chain encoded size BEFORE
+// uploading it — pure computation, no network call, safe to call as often
+// as needed (e.g. as soon as a user picks a file, to warn them if it's
+// small enough that fixed overhead will dominate — see EncodedSizeEstimate's
+// doc comment). encodingType is optional; pass "" to use the default (RS2).
+func EstimateEncodedSize(unencodedLength uint64, nShards uint16, encodingType string) (*EncodedSizeEstimate, error) {
+	payload := map[string]any{
+		"unencoded_length": unencodedLength,
+		"n_shards":         nShards,
+	}
+	if encodingType != "" {
+		payload["encoding_type"] = encodingType
+	}
+	configBuf, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal estimate-encoded-size config: %w", err)
+	}
+
+	cConfig := C.CString(string(configBuf))
+	defer C.free(unsafe.Pointer(cConfig))
+
+	raw := C.walrus_estimate_encoded_size(cConfig)
+	if raw == nil {
+		return nil, fmt.Errorf("walrus_estimate_encoded_size returned nil")
+	}
+	defer C.walrus_free_string(raw)
+
+	var result struct {
+		EncodedSizeEstimate
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(raw)), &result); err != nil {
+		return nil, fmt.Errorf("parse estimate-encoded-size response: %w", err)
+	}
+	if result.Error != "" {
+		return nil, fmt.Errorf("walrus error: %s", result.Error)
+	}
+	return &result.EncodedSizeEstimate, nil
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
