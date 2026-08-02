@@ -87,7 +87,7 @@ type NetworkConfig struct {
 	// the pooled-model equivalent of WalrusObjectType, NOT the same as
 	// WalrusStoragePoolObjectType. Same Move module (storage_pool), same
 	// package, different struct name.
-	WalrusPooledBlobObjectType string
+	//
 	// WalrusStakingObject is the on-chain object ID used to query epoch info.
 	WalrusStakingObject string
 	WalrusSystemObject  string
@@ -100,8 +100,7 @@ var TestnetConfig = NetworkConfig{
 	GRPCEndpoint:                "fullnode.testnet.sui.io:443",
 	GraphQLEndpoint:             "https://graphql.testnet.sui.io/graphql",
 	WalrusObjectType:            "0xd84704c17fc870b8764832c535aa6b11f21a95cd6f5bb38a9b07d2cf42220c66::blob::Blob",
-	WalrusStoragePoolObjectType: "0xd84704c17fc870b8764832c535aa6b11f21a95cd6f5bb38a9b07d2cf42220c66::storage_pool::StoragePool",
-	WalrusPooledBlobObjectType:  "0xd84704c17fc870b8764832c535aa6b11f21a95cd6f5bb38a9b07d2cf42220c66::storage_pool::PooledBlob",
+	WalrusStoragePoolObjectType: "0x849e95d2718938d66c37fb91df76d72f78526c1864c339bac415ce8ecda2d8cc::storage_pool::StoragePool",
 	WalrusStakingObject:         "0xbe46180321c30aab2f8b3501e24048377287fa708018a5b7c2792b35fe339ee3",
 	WalrusSystemObject:          "0x6c2547cbbc38025cf3adac45f63cb0a8d12ecf777cdc75a4971612bf97fdf6af",
 	WalrusCoinObject:            "0x8270feb7375eee355e64fdb69c50abb6b5f9393a722883c1cf45f8e26048810a::wal::WAL",
@@ -114,7 +113,6 @@ var MainnetConfig = NetworkConfig{
 	GraphQLEndpoint:             "https://graphql.mainnet.sui.io/graphql",
 	WalrusObjectType:            "0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::blob::Blob",
 	WalrusStoragePoolObjectType: "0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::storage_pool::StoragePool",
-	WalrusPooledBlobObjectType:  "0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::storage_pool::PooledBlob",
 	WalrusStakingObject:         "0x10b9d30c28448939ce6c4d6c6e0ffce4a7f8a4ada8248bdad09ef8b70e4a3904",
 	WalrusSystemObject:          "0x2134d52768ea07e8c43570ef975eb3e4c27a39fa6396bef985b5abc58d03ddd2",
 	WalrusCoinObject:            "0x356a26eb9e012a68958082340d4c4116e7f55615cf27affcff209cf0ae544f59::wal::WAL",
@@ -664,6 +662,7 @@ func getWalrusEpochTime(ctx context.Context, graphqlEndpoint, stakingObject stri
 	if !ok {
 		return nil, fmt.Errorf("epoch missing or wrong type")
 	}
+
 	end := start + duration
 	return &Epoch{
 		Start:   time.UnixMilli(int64(start)),
@@ -874,12 +873,12 @@ func GetFileName(
 
 // FileEntry holds the human-readable properties of a valid Walrus file.
 type FileEntry struct {
-	ObjectID    string    `db:"object_id"`    // Sui blob object ID (0x...)
-	BlobID      string    `db:"blob_id"`      // Walrus blob ID (base64url)
-	Filename    string    `db:"filename"`     // decrypted filename from on-chain metadata
-	CertifiedAt time.Time `db:"certified_at"` // wall-clock time the blob was certified
-	ExpiresAt   time.Time `db:"expires_at"`   // wall-clock time the blob expires
-	SizeBytes   uint64    `db:"size_bytes"`   // original unencoded size in bytes
+	ObjectID    string     `db:"object_id"`    // Sui blob object ID (0x...)
+	BlobID      string     `db:"blob_id"`      // Walrus blob ID (base64url)
+	Filename    string     `db:"filename"`     // decrypted filename from on-chain metadata
+	CertifiedAt time.Time  `db:"certified_at"` // wall-clock time the blob was certified
+	ExpiresAt   *time.Time `db:"expires_at"`   // wall-clock time the blob expires
+	SizeBytes   uint64     `db:"size_bytes"`   // original unencoded size in bytes
 }
 
 // GetAllFiles returns all valid (non-expired) files owned by privKey on the
@@ -1023,13 +1022,14 @@ func GetAllFiles(
 				results[i] = result{skip: true}
 				return
 			}
+			expire := epochToTime(c.endEpoch)
 			results[i] = result{
 				entry: FileEntry{
 					ObjectID:    c.objectID,
 					BlobID:      c.blobIDBase64,
 					Filename:    m.Filename,
 					CertifiedAt: epochToTime(c.certifiedEpoch),
-					ExpiresAt:   epochToTime(c.endEpoch),
+					ExpiresAt:   &expire,
 					SizeBytes:   c.sizeBytes,
 				},
 			}
@@ -1047,9 +1047,9 @@ func GetAllFiles(
 	return files, nil
 }
 
-func GetAllFilesUncertified(
+func GetAllPoolFiles(
 	conn *grpc.ClientConn, mk *crypt.MasterKey,
-	StoragePoolID *string, ctx context.Context,
+	ctx context.Context, storage_pool string,
 	privKey *signer.Signer, net NetworkConfig,
 ) ([]FileEntry, error) {
 	// 1. Get current epoch info for epoch→wall-clock conversion.
@@ -1065,83 +1065,45 @@ func GetAllFilesUncertified(
 	}
 
 	// 2. Fetch all owned blob objects in one gRPC call.
-	var (
-		pageToken  []byte
-		allObjects []*generated.Object
+	allObjects, err := GetStoragePoolBlobObjects(
+		ctx, net.GraphQLEndpoint, storage_pool,
 	)
-
-	for {
-		resp, err := OwnedObjects(
-			conn,
-			privKey.Address,
-			net.WalrusObjectType,
-			&pageSize,
-			pageToken,
-			ctx,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("list owned blobs (page token %x): %w", pageToken, err)
-		}
-
-		allObjects = append(allObjects, resp.Objects...)
-
-		// GetNextPageToken() returns nil/empty when there are no more pages.
-		nextToken := resp.GetNextPageToken()
-		if len(nextToken) == 0 {
-			break
-		}
-		pageToken = nextToken
-	}
 
 	// 3. Filter expired/uncertified blobs before issuing any GraphQL calls.
 	type candidate struct {
 		objectID       string
 		blobIDBase64   string
 		certifiedEpoch float64
-		endEpoch       float64
 		sizeBytes      uint64
 	}
 	var candidates []candidate
 	for i := range allObjects {
 		obj := allObjects[i]
-		raw, ok := obj.Json.AsInterface().(map[string]any)
-		if !ok {
-			continue
-		}
-		storage, ok := raw["storage"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if StoragePoolID == nil {
-			continue
-		}
-		if strings.EqualFold(*StoragePoolID, storage["id"].(string)) == false {
-			continue
-		}
-		endEpoch, ok := storage["end_epoch"].(float64)
-		if !ok {
-			continue
-		}
-		certifiedEpochRaw := raw["certified_epoch"]
+		certifiedEpochRaw := obj["certified_epoch"]
+		var certifiedEpoch float64 = 0
 		if certifiedEpochRaw != nil {
-			continue // certified
+			var ok bool
+			certifiedEpoch, ok = certifiedEpochRaw.(float64)
+			if !ok {
+				continue
+			}
 		}
-		blobIDDecimal, ok := raw["blob_id"].(string)
+
+		blobIDDecimal, ok := obj["blob_id"].(string)
 		if !ok {
 			continue
 		}
 		var sizeBytes uint64
-		if sizeRaw, ok := raw["size"].(string); ok && sizeRaw != "" {
+		if sizeRaw, ok := obj["size"].(string); ok && sizeRaw != "" {
 			if v, err := strconv.ParseUint(sizeRaw, 10, 64); err == nil {
 				sizeBytes = v
 			}
 			// else: log.Printf("unexpected size format %q for object %s", sizeRaw, objectID)
 		}
 		candidates = append(candidates, candidate{
-			objectID:       *obj.ObjectId,
+			objectID:       obj["id"].(string),
 			blobIDBase64:   BlobIDToBase64(blobIDDecimal),
-			certifiedEpoch: 0,
-			endEpoch:       endEpoch,
+			certifiedEpoch: certifiedEpoch,
 			sizeBytes:      sizeBytes,
 		})
 	}
@@ -1187,7 +1149,7 @@ func GetAllFilesUncertified(
 					BlobID:      c.blobIDBase64,
 					Filename:    m.Filename,
 					CertifiedAt: epochToTime(c.certifiedEpoch),
-					ExpiresAt:   epochToTime(c.endEpoch),
+					ExpiresAt:   nil,
 					SizeBytes:   c.sizeBytes,
 				},
 			}
@@ -1408,11 +1370,29 @@ type StoragePoolStatus struct {
 // StoreBlobInPool stores a blob into a specific storage pool instead of the
 // caller's own owned Storage. See the warning above this section before
 // adding any retry logic around this call.
+// PoolStoreError is returned by StoreBlobInPool on failure. FailurePhase is
+// nil only when the failure was before any chain call (config/wallet setup)
+// — that case is always safe to retry StoreBlobInPool clean. Any non-nil
+// FailurePhase means something already reached the chain; do NOT retry
+// StoreBlobInPool itself — see ResumePoolUpload.
+type PoolStoreError struct {
+	Message      string
+	FailurePhase *string
+	BlobID       string // best-effort; empty if the failure was too early to know it
+}
+
+func (e *PoolStoreError) Error() string { return e.Message }
+
+// StoreBlobInPool stores a blob into a specific storage pool. On failure,
+// the returned error is always a *PoolStoreError — inspect its
+// FailurePhase before deciding whether to retry (see ResumePoolUpload for
+// the correct way to recover from a partial failure instead of retrying
+// this call blindly).
 func StoreBlobInPool(
 	epochs uint32, deletable bool,
 	storagePoolObjectID string, data []byte,
 	privKey *signer.Signer,
-) (*StoreResult, error) {
+) (*PooledBlobResult, error) {
 	walrusConfigPath, err := ConfigPath()
 	if err != nil {
 		return nil, err
@@ -1448,21 +1428,359 @@ func StoreBlobInPool(
 	defer C.walrus_free_string(raw)
 
 	var combined struct {
-		BlobID           string `json:"blob_id"`
-		AlreadyCertified bool   `json:"already_certified"`
-		TxDigest         string `json:"tx_digest"`
-		Error            string `json:"error"`
+		BlobID             string  `json:"blob_id"`
+		PooledBlobObjectID string  `json:"pooled_blob_object_id"`
+		AlreadyCertified   bool    `json:"already_certified"`
+		Error              string  `json:"error"`
+		FailurePhase       *string `json:"failure_phase"`
 	}
 	if err := json.Unmarshal([]byte(C.GoString(raw)), &combined); err != nil {
 		return nil, fmt.Errorf("failed to parse result JSON: %w", err)
 	}
 	if combined.Error != "" {
-		return nil, fmt.Errorf("walrus error: %s", combined.Error)
+		return nil, &PoolStoreError{
+			Message:      combined.Error,
+			FailurePhase: combined.FailurePhase,
+			BlobID:       combined.BlobID,
+		}
 	}
-	return &StoreResult{
-		BlobID:           combined.BlobID,
-		AlreadyCertified: combined.AlreadyCertified,
-		TxDigest:         combined.TxDigest,
+	return &PooledBlobResult{
+		BlobID:             combined.BlobID,
+		PooledBlobObjectID: combined.PooledBlobObjectID,
+		AlreadyCertified:   combined.AlreadyCertified,
+	}, nil
+}
+
+// PooledBlobResult is returned by StoreBlobInPool on success.
+type PooledBlobResult struct {
+	BlobID             string
+	PooledBlobObjectID string
+	AlreadyCertified   bool
+}
+
+// RegisterPooledBlob registers a new PooledBlob entry in the given storage
+// pool. Call this EXACTLY ONCE per logical upload — persist the returned
+// pooledBlobObjectID before calling UploadAndCertifyPooledBlob. Do not
+// retry this call automatically on failure; check real chain state first
+// (ResumePoolUpload does this for you).
+func RegisterPooledBlob(
+	storagePoolObjectID string, deletable bool, encodingType string,
+	data []byte, privKey *signer.Signer,
+) (blobID, pooledBlobObjectID string, err error) {
+	walrusConfigPath, err := ConfigPath()
+	if err != nil {
+		return "", "", err
+	}
+
+	payload := map[string]any{
+		"walrus_config":          walrusConfigPath,
+		"storage_pool_object_id": storagePoolObjectID,
+		"deletable":              deletable,
+	}
+	if encodingType != "" {
+		payload["encoding_type"] = encodingType
+	}
+	configBuf, err := walrusConfigJSON(payload, privKey)
+	if err != nil {
+		return "", "", fmt.Errorf("marshal register-pooled-blob config: %w", err)
+	}
+
+	cConfig := C.CString(string(configBuf))
+	zeroBytes(configBuf)
+	defer func() {
+		C.memset(unsafe.Pointer(cConfig), 0, C.size_t(C.strlen(cConfig)))
+		C.free(unsafe.Pointer(cConfig))
+	}()
+
+	var cDataPtr *C.uint8_t
+	if len(data) > 0 {
+		cDataPtr = (*C.uint8_t)(C.CBytes(data))
+		defer C.free(unsafe.Pointer(cDataPtr))
+	}
+
+	raw := C.walrus_register_pooled_blob(cConfig, cDataPtr, C.size_t(len(data)))
+	if raw == nil {
+		return "", "", fmt.Errorf("walrus_register_pooled_blob returned nil")
+	}
+	defer C.walrus_free_string(raw)
+
+	var result struct {
+		BlobID             string `json:"blob_id"`
+		PooledBlobObjectID string `json:"pooled_blob_object_id"`
+		Error              string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(raw)), &result); err != nil {
+		return "", "", fmt.Errorf("parse register-pooled-blob response: %w", err)
+	}
+	if result.Error != "" {
+		return "", "", fmt.Errorf("walrus error: %s", result.Error)
+	}
+	return result.BlobID, result.PooledBlobObjectID, nil
+}
+
+// UploadAndCertifyPooledBlob uploads slivers for an already-registered
+// PooledBlob and certifies it. Safe to call repeatedly with backoff on
+// failure — always checks on-chain certification state first, so a retry
+// after a lost response won't double-certify. data must be the same bytes
+// originally passed to RegisterPooledBlob.
+func UploadAndCertifyPooledBlob(
+	storagePoolObjectID, pooledBlobObjectID, blobID, encodingType string,
+	data []byte, privKey *signer.Signer,
+) (alreadyCertified bool, err error) {
+	walrusConfigPath, err := ConfigPath()
+	if err != nil {
+		return false, err
+	}
+
+	payload := map[string]any{
+		"walrus_config":          walrusConfigPath,
+		"storage_pool_object_id": storagePoolObjectID,
+		"pooled_blob_object_id":  pooledBlobObjectID,
+		"blob_id":                blobID,
+	}
+	if encodingType != "" {
+		payload["encoding_type"] = encodingType
+	}
+	configBuf, err := walrusConfigJSON(payload, privKey)
+	if err != nil {
+		return false, fmt.Errorf("marshal upload-and-certify config: %w", err)
+	}
+
+	cConfig := C.CString(string(configBuf))
+	zeroBytes(configBuf)
+	defer func() {
+		C.memset(unsafe.Pointer(cConfig), 0, C.size_t(C.strlen(cConfig)))
+		C.free(unsafe.Pointer(cConfig))
+	}()
+
+	var cDataPtr *C.uint8_t
+	if len(data) > 0 {
+		cDataPtr = (*C.uint8_t)(C.CBytes(data))
+		defer C.free(unsafe.Pointer(cDataPtr))
+	}
+
+	raw := C.walrus_upload_and_certify_pooled_blob(cConfig, cDataPtr, C.size_t(len(data)))
+	if raw == nil {
+		return false, fmt.Errorf("walrus_upload_and_certify_pooled_blob returned nil")
+	}
+	defer C.walrus_free_string(raw)
+
+	var result struct {
+		AlreadyCertified bool   `json:"already_certified"`
+		Error            string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(raw)), &result); err != nil {
+		return false, fmt.Errorf("parse upload-and-certify response: %w", err)
+	}
+	if result.Error != "" {
+		return false, fmt.Errorf("walrus error: %s", result.Error)
+	}
+	return result.AlreadyCertified, nil
+}
+
+// ResumePoolUpload decides what to do about a StoreBlobInPool call that
+// didn't cleanly succeed, WITHOUT blindly retrying it. It checks real chain
+// state before acting, per the RESUME LOGIC documented on
+// walrus_store_blob_in_pool in the Rust crate:
+//
+//   - storeErr's FailurePhase is nil          → nothing reached chain,
+//     safe to call StoreBlobInPool again from scratch.
+//   - pooledBlobObjectID unknown (registration
+//     never confirmed)                        → query the pool for this
+//     blobID; not found → StoreBlobInPool from scratch; found → fall
+//     through to the certify check below using the discovered object id.
+//   - pooledBlobObjectID known, uncertified   → call
+//     UploadAndCertifyPooledBlob.
+//   - pooledBlobObjectID known, certified     → already done; nothing to
+//     do on-chain, just update your own bookkeeping.
+//
+// Returns the resolved PooledBlobResult once the blob is confirmed
+// certified (whether that required action here or was already true).
+// StoreBlobInPoolSplit is an alternative to StoreBlobInPool, built from the
+// two split primitives (RegisterPooledBlob + UploadAndCertifyPooledBlob)
+// instead of the atomic reserve_and_store_blobs_in_storage_pool call. This
+// gives you two independently working upload routes to test/compare —
+// StoreBlobInPool is the confirmed-working atomic path; this is the split
+// path the resume mechanism will build on later.
+//
+// Retry policy is deliberately asymmetric between the two phases, per what
+// we know about each one's safety:
+//
+//   - Register (phase 1): retried only when the error looks transient/
+//     network-level — i.e. the kind where the request almost certainly
+//     never reached the chain (connection refused, timeout, transport
+//     error, etc). Anything else is surfaced immediately, NOT retried.
+//     Without a chain-state check (that's the resume mechanism, explicitly
+//     out of scope for this function), we can't reliably tell "never
+//     landed" apart from "landed, response lost" — so a residual, small
+//     risk of ending up with a duplicate PooledBlob remains for that
+//     specific ambiguous case. Accepted for now per your scope; the resume
+//     mechanism is what closes this gap properly later.
+//   - UploadAndCertify (phase 2): retried freely with backoff — this step
+//     is genuinely idempotent (it checks is_certified() before doing
+//     anything), so no such caution is needed here.
+//
+// On a phase-2 failure after all retries, the returned error includes
+// pooledBlobObjectID — registration already succeeded at that point, so
+// don't discard it; it's exactly what ResumePoolUpload will need later.
+func StoreBlobInPoolSplit(
+	epochs uint32, deletable bool,
+	storagePoolObjectID, encodingType string, data []byte,
+	privKey *signer.Signer,
+) (*PooledBlobResult, error) {
+	const (
+		registerMaxAttempts = 3
+		registerBaseDelay   = 2 * time.Second
+		certifyMaxAttempts  = 5
+		certifyBaseDelay    = 3 * time.Second
+	)
+
+	// ── Phase 1: register ────────────────────────────────────────────────
+	var blobID, pooledBlobObjectID string
+	var err error
+	for attempt := 1; attempt <= registerMaxAttempts; attempt++ {
+		blobID, pooledBlobObjectID, err = RegisterPooledBlob(
+			storagePoolObjectID, deletable, encodingType, data, privKey,
+		)
+		if err == nil {
+			break
+		}
+		if !isTransientError(err) {
+			return nil, fmt.Errorf(
+				"register pooled blob: not retrying — error doesn't look "+
+					"transient, and blind retry here risks a duplicate "+
+					"PooledBlob without a chain-state check: %w", err,
+			)
+		}
+		if attempt == registerMaxAttempts {
+			return nil, fmt.Errorf(
+				"register pooled blob failed after %d attempts: %w",
+				registerMaxAttempts, err,
+			)
+		}
+		time.Sleep(registerBaseDelay * time.Duration(1<<(attempt-1))) // 2s, 4s, ...
+	}
+
+	// ── Phase 2: upload + certify — safe to retry freely ────────────────
+	var alreadyCertified bool
+	for attempt := 1; attempt <= certifyMaxAttempts; attempt++ {
+		alreadyCertified, err = UploadAndCertifyPooledBlob(
+			storagePoolObjectID, pooledBlobObjectID, blobID, encodingType, data, privKey,
+		)
+		if err == nil {
+			break
+		}
+		if attempt == certifyMaxAttempts {
+			return nil, fmt.Errorf(
+				"upload-and-certify failed after %d attempts "+
+					"(pooled_blob_object_id=%s — registration already "+
+					"succeeded, this can be resumed later without "+
+					"re-registering): %w",
+				certifyMaxAttempts, pooledBlobObjectID, err,
+			)
+		}
+		time.Sleep(certifyBaseDelay * time.Duration(1<<(attempt-1))) // 3s, 6s, 12s, 24s
+	}
+
+	return &PooledBlobResult{
+		BlobID:             blobID,
+		PooledBlobObjectID: pooledBlobObjectID,
+		AlreadyCertified:   alreadyCertified,
+	}, nil
+}
+
+// isTransientError does a best-effort classification of whether err looks
+// like a network/transport-level failure (request very likely never
+// reached the chain) versus something else (simulation failure,
+// insufficient gas, bad object reference, etc — where blind retry either
+// won't help or risks acting twice on a request that may have actually
+// landed). Deliberately conservative: only clearly-transient patterns
+// return true, everything else defaults to "don't retry".
+func isTransientError(err error) bool {
+	msg := err.Error()
+	transientSubstrings := []string{
+		"error sending request",
+		"connection refused",
+		"connection reset",
+		"context deadline exceeded",
+		"i/o timeout",
+		"transport:",
+		"unavailable",
+		"EOF",
+		"broken pipe",
+		"no route to host",
+	}
+	for _, s := range transientSubstrings {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func ResumePoolUpload(
+	ctx context.Context, net NetworkConfig,
+	storagePoolObjectID, blobID, pooledBlobObjectID string,
+	storeErr *PoolStoreError,
+	epochs uint32, deletable bool, encodingType string, data []byte,
+	privKey *signer.Signer,
+) (*PooledBlobResult, error) {
+	// Case 1: failure was before anything reached the chain.
+	if storeErr != nil && storeErr.FailurePhase == nil {
+		return StoreBlobInPool(epochs, deletable, storagePoolObjectID, data, privKey)
+	}
+
+	// Case 2/3/4: check real chain state before doing anything else.
+	rawBlobs, err := GetStoragePoolBlobObjects(ctx, net.GraphQLEndpoint, storagePoolObjectID)
+	if err != nil {
+		return nil, fmt.Errorf("check chain state before resuming: %w", err)
+	}
+
+	var found map[string]any
+	for _, b := range rawBlobs {
+		if pooledBlobObjectID != "" {
+			// Caller already knows the object id (from a prior partial
+			// success) — match on that directly rather than blob_id.
+			if id, ok := b["id"].(string); ok && id == pooledBlobObjectID {
+				found = b
+				break
+			}
+			continue
+		}
+		if bID, ok := b["blob_id"].(string); ok && BlobIDToBase64(bID) == blobID {
+			found = b
+			break
+		}
+	}
+
+	if found == nil {
+		// Genuinely never registered (or registered with a blob_id we're not
+		// matching correctly — worth double-checking blobID's encoding if
+		// this path triggers unexpectedly often).
+		return StoreBlobInPool(epochs, deletable, storagePoolObjectID, data, privKey)
+	}
+
+	objectID, _ := found["id"].(string)
+	if found["certified_epoch"] != nil {
+		// Already done — this was a stale-read false failure, not a real one.
+		return &PooledBlobResult{
+			BlobID:             blobID,
+			PooledBlobObjectID: objectID,
+			AlreadyCertified:   true,
+		}, nil
+	}
+
+	// Registered but not certified — finish it, don't re-register.
+	alreadyCertified, err := UploadAndCertifyPooledBlob(
+		storagePoolObjectID, objectID, blobID, encodingType, data, privKey,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resume upload-and-certify: %w", err)
+	}
+	return &PooledBlobResult{
+		BlobID:             blobID,
+		PooledBlobObjectID: objectID,
+		AlreadyCertified:   alreadyCertified,
 	}, nil
 }
 
@@ -1597,7 +1915,6 @@ func IncreaseStoragePoolCapacity(storagePoolObjectID string, additionalEncodedCa
 
 func GetAllStoragePools(
 	conn *grpc.ClientConn,
-	mk *crypt.MasterKey,
 	ctx context.Context,
 	privKey *signer.Signer,
 	net NetworkConfig,
@@ -2233,6 +2550,9 @@ func GetObject(conn *grpc.ClientConn, objectId string, version *uint64, ctx cont
 	resp, err := client.GetObject(ctx, &generated.GetObjectRequest{
 		ObjectId: &objectId,
 		Version:  version,
+		ReadMask: &fieldmaskpb.FieldMask{
+			Paths: []string{"version", "digest", "object_type"},
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -2673,4 +2993,27 @@ func fetchStoragePoolVersionAndDigest(conn *grpc.ClientConn, ctx context.Context
 		return 0, "", err
 	}
 	return resp.Object.GetVersion(), resp.Object.GetDigest(), nil
+}
+
+// formatStorage returns the human-readable storage string.
+func formatStoragePool(amount uint64) string {
+	const (
+		TB = 1_000_000_000_000.0
+		GB = 1_000_000_000.0
+		MB = 1_000_000.0
+		KB = 1_000.0
+	)
+	f := float64(amount)
+	switch {
+	case f >= TB:
+		return fmt.Sprintf("Total: %.2f TB", f/TB)
+	case f >= GB:
+		return fmt.Sprintf("Total: %.2f GB", f/GB)
+	case f >= MB:
+		return fmt.Sprintf("Total: %.2f MB", f/MB)
+	case f >= KB:
+		return fmt.Sprintf("Total: %.2f KB", f/KB)
+	default:
+		return fmt.Sprintf("Total: %d bytes", amount)
+	}
 }

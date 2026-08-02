@@ -66,7 +66,8 @@ char* walrus_store_blob(const char*    config_json,
  *  walrus_extend_blob / walrus_list_blobs / walrus_delete_blobs /
  *  walrus_store_blob_in_pool / walrus_create_storage_pool /
  *  walrus_extend_storage_pool / walrus_increase_storage_pool_capacity /
- *  walrus_storage_pool_status. */
+ *  walrus_storage_pool_status / walrus_register_pooled_blob /
+ *  walrus_upload_and_certify_pooled_blob. */
 void walrus_free_string(char* ptr);
 
 
@@ -262,21 +263,80 @@ char* walrus_delete_blobs(const char* config_json);
  * data_ptr / data_len – raw blob bytes to store.
  *
  * Returns a heap-allocated C string with JSON:
- *   success: {"blob_id":"…","already_certified":bool,"tx_digest":"…"}
- *   failure: {"error":"…"}
+ *   success: {"blob_id":"…","pooled_blob_object_id":"…","already_certified":false}
+ *   failure: {"error":"…","failure_phase":"…" or null,"blob_id":"…" or null}
  *
- * WARNING — pooled blob registration is NOT idempotent. Do not retry this
- * call blindly on failure from the caller: a retry after a partially
- * succeeded attempt (e.g. registration landed but upload/certify then
- * failed) can create a duplicate PooledBlob for the same content in the
- * pool. There is no "already registered, reuse it" case — only success or
- * error.
+ * failure_phase == null means the failure was before any chain call
+ * (config/wallet setup) — always safe to retry this call clean.
+ * failure_phase set means something already reached the chain — do NOT
+ * retry this call blindly. Instead: check real chain state for this
+ * blob_id, then either retry this call clean (nothing found), call
+ * walrus_upload_and_certify_pooled_blob with the pooled_blob_object_id
+ * (found, uncertified), or just update your own bookkeeping (found,
+ * already certified — this can happen even on a reported failure, due to
+ * read-after-write staleness on the immediate post-certify check).
  *
  * MUST be freed with walrus_free_string().
  */
 char* walrus_store_blob_in_pool(const char*    config_json,
                                  const uint8_t* data_ptr,
                                  size_t         data_len);
+
+/**
+ * Registers a new PooledBlob entry in the given storage pool. Call this
+ * EXACTLY ONCE per logical upload — persist the returned
+ * pooled_blob_object_id before calling walrus_upload_and_certify_pooled_blob.
+ * Do not retry this call automatically on failure; check real chain state
+ * first (see walrus_store_blob_in_pool's doc comment above).
+ *
+ * config_json – UTF-8 JSON:
+ *   {
+ *     "walrus_config":          "/path/to/client_config.yaml",
+ *     "storage_pool_object_id": "0x…",
+ *     "deletable":              false,
+ *     "encoding_type":          "RS2",       ← optional
+ *     "private_key":            "<base64_std([0x00] || seed_32_bytes)>",
+ *     "sui_address":            "0x…"
+ *   }
+ *
+ * data_ptr / data_len – raw blob bytes (needed to compute blob_id/metadata;
+ * NOT uploaded to storage nodes in this call — that happens in
+ * walrus_upload_and_certify_pooled_blob).
+ *
+ * Returns JSON: {"blob_id":"…","pooled_blob_object_id":"…"} or {"error":"…"}
+ * MUST be freed with walrus_free_string().
+ */
+char* walrus_register_pooled_blob(const char*    config_json,
+                                   const uint8_t* data_ptr,
+                                   size_t         data_len);
+
+/**
+ * Uploads slivers for an already-registered PooledBlob and certifies it.
+ * Safe to call repeatedly with backoff on failure — always checks on-chain
+ * certification state first, so a retry after a lost response won't
+ * double-certify.
+ *
+ * config_json – UTF-8 JSON:
+ *   {
+ *     "walrus_config":          "/path/to/client_config.yaml",
+ *     "storage_pool_object_id": "0x…",
+ *     "pooled_blob_object_id":  "0x…",       ← from walrus_register_pooled_blob
+ *     "blob_id":                "<base64url>",
+ *     "encoding_type":          "RS2",       ← optional
+ *     "private_key":            "<base64_std([0x00] || seed_32_bytes)>",
+ *     "sui_address":            "0x…"
+ *   }
+ *
+ * data_ptr / data_len – raw blob bytes — MUST be the same bytes originally
+ * passed to walrus_register_pooled_blob (re-encoded here; encoding is not
+ * persisted between the two calls).
+ *
+ * Returns JSON: {"already_certified":bool} or {"error":"…"}
+ * MUST be freed with walrus_free_string().
+ */
+char* walrus_upload_and_certify_pooled_blob(const char*    config_json,
+                                             const uint8_t* data_ptr,
+                                             size_t         data_len);
 
 /**
  * Creates a new storage pool and returns its object ID.

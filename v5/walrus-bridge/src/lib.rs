@@ -36,6 +36,7 @@ use walrus_sdk::{
 };
 use walrus_sui::client::BlobPersistence;
 use walrus_sui::types::move_structs::BlobAttribute;
+use walrus_core::encoding::EncodingFactory;
 use walrus_sui::types::move_structs::ObjectID;
 
 // ── Shared Tokio runtime ──────────────────────────────────────────────────────
@@ -443,22 +444,26 @@ pub extern "C" fn walrus_store_blob(
 // black box on failure. register_pooled_blob (the underlying Move call)
 // creates a brand-new PooledBlob object in the pool every time it's called —
 // there is no on-chain check for "does this pool already have an entry for
-// this blob_id" the way there is for the classic Storage/Blob model. Notice
-// PooledBlobStoreResult below only has two variants — NewlyCreated and
-// Error — there is no AlreadyCertified/reuse case at all. If a first attempt
-// registers successfully but then fails during upload or certify (network
-// blip, node timeout, process killed), and Go retries this whole call, you
-// get a second PooledBlob for the same content sitting in the pool, burning
-// extra capacity and WAL.
+// this blob_id" the way there is for the classic Storage/Blob model.
 //
-// PooledBlobStoreResult::Error carries a `failure_phase` string precisely so
-// callers can tell these cases apart — inspect it before deciding whether a
-// retry is safe. Treat anything that isn't clearly "failed before
-// registration" as NOT safely retryable without first checking, out-of-band,
-// whether a PooledBlob for this blob_id already exists in the pool (fetch by
-// id if you tracked one, or list the pool's contents). Do not wire an
-// automatic backoff retry loop around walrus_store_blob_in_pool the way you
-// might around walrus_store_blob until that check is in place.
+// RESUME LOGIC — do not blindly retry walrus_store_blob_in_pool. Instead:
+//   1. On error, inspect `failure_phase` (structured field on PoolStoreResult
+//      ::Err below — None means the failure was before any chain call at
+//      all, e.g. config/wallet setup, always safe to retry clean).
+//   2. If failure_phase indicates the failure happened at or after
+//      registration, do NOT call walrus_store_blob_in_pool again. Instead
+//      check real chain state for this blob_id (e.g. via
+//      GetStoragePoolBlobObjects on the Go side), then either:
+//        - not found at all  → safe to retry walrus_store_blob_in_pool clean
+//        - found, uncertified → call walrus_upload_and_certify_pooled_blob
+//          with its pooled_blob_object_id (idempotent — checks
+//          is_certified() before doing anything, safe to retry as many
+//          times as needed)
+//        - found, certified   → already done; just update your own
+//          bookkeeping, no chain action needed
+//
+// walrus_register_pooled_blob / walrus_upload_and_certify_pooled_blob below
+// are the split-phase primitives this resume flow is built from.
 
 #[derive(Debug, Deserialize, ZeroizeOnDrop)]
 struct PoolBridgeConfig {
@@ -476,7 +481,25 @@ struct PoolBridgeConfig {
     sui_address: String,
 }
 
-async fn store_in_pool_async(config: PoolBridgeConfig, data: Vec<u8>) -> Result<FfiResult> {
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum PoolStoreResult {
+    Ok {
+        blob_id: String,
+        pooled_blob_object_id: String,
+        already_certified: bool,
+    },
+    Err {
+        error: String,
+        /// Structured, so Go can branch on it directly instead of parsing
+        /// text out of `error`. See RESUME LOGIC comment below — this is
+        /// the field the whole recovery design hinges on.
+        failure_phase: Option<String>,
+        blob_id: Option<String>,
+    },
+}
+
+async fn store_in_pool_async(config: PoolBridgeConfig, data: Vec<u8>) -> Result<PoolStoreResult> {
     let wallet = build_ephemeral_wallet(
         &config.private_key,
         &config.sui_address,
@@ -524,22 +547,19 @@ async fn store_in_pool_async(config: PoolBridgeConfig, data: Vec<u8>) -> Result<
     }
 
     match results.remove(0) {
-        PooledBlobStoreResult::NewlyCreated { pooled_blob_object } => Ok(FfiResult::Ok {
+        PooledBlobStoreResult::NewlyCreated { pooled_blob_object } => Ok(PoolStoreResult::Ok {
             blob_id: URL_SAFE_NO_PAD.encode(pooled_blob_object.blob_id.as_ref()),
+            pooled_blob_object_id: pooled_blob_object.id.to_string(),
             already_certified: false,
-            tx_digest: pooled_blob_object.id.to_string(),
         }),
         PooledBlobStoreResult::Error {
             blob_id,
             failure_phase,
             error_msg,
-        } => Ok(FfiResult::Err {
-            error: format!(
-                "storage-pool store failed in phase '{failure_phase}'{}: {error_msg}",
-                blob_id
-                    .map(|id| format!(" (blob_id {})", URL_SAFE_NO_PAD.encode(id.as_ref())))
-                    .unwrap_or_default()
-            ),
+        } => Ok(PoolStoreResult::Err {
+            error: error_msg,
+            failure_phase: Some(failure_phase),
+            blob_id: blob_id.map(|id| URL_SAFE_NO_PAD.encode(id.as_ref())),
         }),
     }
 }
@@ -556,11 +576,15 @@ async fn store_in_pool_async(config: PoolBridgeConfig, data: Vec<u8>) -> Result<
 ///   "sui_address":            "0x…"
 /// }
 ///
-/// Returns JSON: {"blob_id":"…","already_certified":false,"tx_digest":"…"}
-///           or: {"error":"…"}
+/// Returns JSON:
+///   success: {"blob_id":"…","pooled_blob_object_id":"…","already_certified":false}
+///   failure: {"error":"…","failure_phase":"…" or null,"blob_id":"…" or null}
 ///
-/// See the module comment above this function before adding any retry logic
-/// around this call — it is NOT safely idempotent to retry blindly.
+/// failure_phase == null means the failure was before any chain call (config/
+/// wallet setup) — always safe to retry this call clean. failure_phase set
+/// means something already reached the chain — see the RESUME LOGIC comment
+/// above this function's config struct before retrying.
+///
 /// MUST be freed with walrus_free_string().
 #[no_mangle]
 pub extern "C" fn walrus_store_blob_in_pool(
@@ -590,7 +614,351 @@ pub extern "C" fn walrus_store_blob_in_pool(
 
     let result = match block_on(store_in_pool_async(config, data)) {
         Ok(r) => r,
-        Err(e) => FfiResult::Err {
+        Err(e) => PoolStoreResult::Err {
+            error: format!("{e:#}"),
+            failure_phase: None, // setup-level failure — nothing reached chain, safe to retry clean
+            blob_id: None,
+        },
+    };
+
+    let json = serde_json::to_string(&result)
+        .unwrap_or_else(|_| r#"{"error":"serialise failed"}"#.to_string());
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new(r#"{"error":"response contained null byte"}"#).unwrap())
+        .into_raw()
+}
+
+// ── Storage Pool Recovery Primitives ─────────────────────────────────────────
+//
+// Split-phase versions of walrus_store_blob_in_pool for resuming an
+// interrupted upload. See the RESUME LOGIC comment above walrus_store_
+// blob_in_pool for when to use these instead of retrying that call.
+//
+//   1. walrus_register_pooled_blob    — call ONCE per logical upload.
+//      Returns pooled_blob_object_id. Persist it in your own DB BEFORE
+//      attempting step 2, so a crash between the two steps is recoverable
+//      by re-reading that id rather than re-registering.
+//
+//   2. walrus_upload_and_certify_pooled_blob — safe to retry with backoff
+//      as many times as needed. Always re-fetches the PooledBlob object
+//      first and checks is_certified() before doing anything, so a retry
+//      after a lost response (the certify tx actually landed, but the
+//      caller never found out) self-heals instead of double-certifying.
+
+#[derive(Debug, Deserialize, ZeroizeOnDrop)]
+struct RegisterPoolBlobConfig {
+    #[zeroize(skip)]
+    walrus_config: String,
+    #[zeroize(skip)]
+    storage_pool_object_id: String,
+    #[serde(default)]
+    #[zeroize(skip)]
+    deletable: bool,
+    #[zeroize(skip)]
+    encoding_type: Option<EncodingType>,
+    private_key: String,
+    #[zeroize(skip)]
+    sui_address: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum RegisterPoolBlobResult {
+    Ok {
+        blob_id: String,
+        pooled_blob_object_id: String,
+    },
+    Err {
+        error: String,
+    },
+}
+
+async fn register_pooled_blob_async(
+    config: RegisterPoolBlobConfig,
+    data: Vec<u8>,
+) -> Result<RegisterPoolBlobResult> {
+    let wallet = build_ephemeral_wallet(
+        &config.private_key,
+        &config.sui_address,
+        &config.walrus_config,
+    )?;
+    let client_config = load_configuration(Some(wallet.walrus_config_path.clone()), None)
+        .context("load walrus config")?;
+    let sui_client = client_config
+        .new_contract_client_with_wallet_in_config(None)
+        .await
+        .context("build sui contract client")?;
+    let walrus_client =
+        WalrusNodeClient::new_contract_client_with_refresher(client_config, sui_client)
+            .await
+            .context("build walrus node client")?;
+
+    let storage_pool_object_id: ObjectID = config
+        .storage_pool_object_id
+        .parse()
+        .context("parse storage_pool_object_id")?;
+    let encoding_type = config.encoding_type.unwrap_or(walrus_core::DEFAULT_ENCODING);
+
+    // We only need the metadata here, not the sliver pairs — upload happens
+    // in step 2, against freshly re-supplied bytes. This does mean the
+    // caller pays the encode CPU cost twice across the two calls (once here,
+    // once in walrus_upload_and_certify_pooled_blob) — acceptable, since
+    // encoding is cheap relative to the network round trips either way.
+    let (_sliver_pairs, metadata) = walrus_client
+        .encoding_config()
+        .get_for_type(encoding_type)
+        .encode_with_metadata(data.into())
+        .context("encode blob")?;
+
+    let blob_metadata = walrus_sui::client::BlobObjectMetadata::try_from(&metadata)
+        .context("build BlobObjectMetadata")?;
+
+    let persistence = if config.deletable {
+        BlobPersistence::Deletable
+    } else {
+        BlobPersistence::Permanent
+    };
+
+    let mut pooled_blobs = walrus_client
+        .sui_client()
+        .register_pooled_blobs(storage_pool_object_id, vec![blob_metadata], persistence)
+        .await
+        .context("register_pooled_blobs")?;
+
+    let pooled_blob = pooled_blobs
+        .pop()
+        .context("register_pooled_blobs returned no PooledBlob")?;
+
+    Ok(RegisterPoolBlobResult::Ok {
+        blob_id: URL_SAFE_NO_PAD.encode(pooled_blob.blob_id.as_ref()),
+        pooled_blob_object_id: pooled_blob.id.to_string(),
+    })
+}
+
+/// Registers a new PooledBlob entry in the given storage pool. Call this
+/// EXACTLY ONCE per logical upload — persist the returned
+/// pooled_blob_object_id before calling walrus_upload_and_certify_pooled_blob.
+/// Do not retry this call automatically on failure; check real chain state
+/// first (see the RESUME LOGIC comment above walrus_store_blob_in_pool).
+///
+/// config_json: {
+///   "walrus_config":          "/path/to/client_config.yaml",
+///   "storage_pool_object_id": "0x…",
+///   "deletable":              false,
+///   "encoding_type":          "RS2",       ← optional
+///   "private_key":            "<base64_std([0x00] || seed_32_bytes)>",
+///   "sui_address":            "0x…"
+/// }
+///
+/// Returns JSON: {"blob_id":"…","pooled_blob_object_id":"…"} or {"error":"…"}
+/// MUST be freed with walrus_free_string().
+#[no_mangle]
+pub extern "C" fn walrus_register_pooled_blob(
+    config_json: *const c_char,
+    data_ptr: *const c_uchar,
+    data_len: usize,
+) -> *mut c_char {
+    let config_str = unsafe {
+        match CStr::from_ptr(config_json).to_str() {
+            Ok(s) => s,
+            Err(e) => return err_ptr(format!("invalid config UTF-8: {e}")),
+        }
+    };
+    let config: RegisterPoolBlobConfig = match serde_json::from_str(config_str) {
+        Ok(c) => c,
+        Err(e) => return err_ptr(format!("config parse error: {e}")),
+    };
+    if data_ptr.is_null() && data_len > 0 {
+        return err_ptr("data_ptr is NULL but data_len > 0".to_string());
+    }
+    let data = if data_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(data_ptr, data_len) }.to_vec()
+    };
+
+    let result = match block_on(register_pooled_blob_async(config, data)) {
+        Ok(r) => r,
+        Err(e) => RegisterPoolBlobResult::Err {
+            error: format!("{e:#}"),
+        },
+    };
+
+    let json = serde_json::to_string(&result)
+        .unwrap_or_else(|_| r#"{"error":"serialise failed"}"#.to_string());
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new(r#"{"error":"response contained null byte"}"#).unwrap())
+        .into_raw()
+}
+
+#[derive(Debug, Deserialize, ZeroizeOnDrop)]
+struct UploadCertifyPoolBlobConfig {
+    #[zeroize(skip)]
+    walrus_config: String,
+    #[zeroize(skip)]
+    storage_pool_object_id: String,
+    #[zeroize(skip)]
+    pooled_blob_object_id: String, // from walrus_register_pooled_blob — required
+    #[zeroize(skip)]
+    blob_id: String,
+    #[zeroize(skip)]
+    encoding_type: Option<EncodingType>,
+    private_key: String,
+    #[zeroize(skip)]
+    sui_address: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum UploadCertifyPoolBlobResult {
+    Ok { already_certified: bool },
+    Err { error: String },
+}
+
+async fn upload_and_certify_pooled_blob_async(
+    config: UploadCertifyPoolBlobConfig,
+    data: Vec<u8>,
+) -> Result<UploadCertifyPoolBlobResult> {
+    let wallet = build_ephemeral_wallet(
+        &config.private_key,
+        &config.sui_address,
+        &config.walrus_config,
+    )?;
+    let client_config = load_configuration(Some(wallet.walrus_config_path.clone()), None)
+        .context("load walrus config")?;
+    let sui_client = client_config
+        .new_contract_client_with_wallet_in_config(None)
+        .await
+        .context("build sui contract client")?;
+    let walrus_client =
+        WalrusNodeClient::new_contract_client_with_refresher(client_config, sui_client)
+            .await
+            .context("build walrus node client")?;
+
+    let storage_pool_object_id: ObjectID = config
+        .storage_pool_object_id
+        .parse()
+        .context("parse storage_pool_object_id")?;
+    let pooled_blob_object_id: ObjectID = config
+        .pooled_blob_object_id
+        .parse()
+        .context("parse pooled_blob_object_id")?;
+
+    // ── The idempotency check: always re-fetch chain state first. ──────────
+    // If a previous attempt's certify transaction actually landed but its
+    // response never reached the caller, this short-circuits here instead
+    // of submitting certify_pooled_blobs a second time.
+    let pooled_blob: walrus_sui::types::move_structs::PooledBlob = walrus_client
+        .sui_client()
+        .retriable_sui_client()
+        .get_sui_object(pooled_blob_object_id)
+        .await
+        .context("fetch PooledBlob object")?;
+
+    if pooled_blob.certified_epoch.is_some() {
+        return Ok(UploadCertifyPoolBlobResult::Ok {
+            already_certified: true,
+        });
+    }
+
+    let expected_blob_id: walrus_core::BlobId =
+        config.blob_id.parse().context("parse blob_id")?;
+    anyhow::ensure!(
+        pooled_blob.blob_id == expected_blob_id,
+        "pooled_blob_object_id does not correspond to the given blob_id"
+    );
+
+    let encoding_type = config.encoding_type.unwrap_or(walrus_core::DEFAULT_ENCODING);
+    let (sliver_pairs, metadata) = walrus_client
+        .encoding_config()
+        .get_for_type(encoding_type)
+        .encode_with_metadata(data.into())
+        .context("encode blob")?;
+    anyhow::ensure!(
+        *metadata.blob_id() == expected_blob_id,
+        "computed blob_id does not match the given blob_id — wrong data for this upload?"
+    );
+
+    // Mirrors Mysten's own pooled-store pipeline (store_backend/pooled.rs:
+    // get_certificate), which sleeps on
+    // config.communication_config.registration_delay before uploading, to
+    // give storage nodes time to index the registration event first. We
+    // don't have easy access to that exact configured value from here, so
+    // this uses a fixed conservative default instead — tune if you see
+    // NOT_REGISTERED errors persisting past this wait.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let certificate = walrus_client
+        .send_blob_data_and_get_certificate(
+            &metadata,
+            Arc::new(sliver_pairs),
+            &pooled_blob.blob_persistence_type(),
+            None,
+            TailHandling::Blocking,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .context("send_blob_data_and_get_certificate")?;
+
+    walrus_client
+        .sui_client()
+        .certify_pooled_blobs(storage_pool_object_id, &[(&pooled_blob, certificate)])
+        .await
+        .context("certify_pooled_blobs")?;
+
+    Ok(UploadCertifyPoolBlobResult::Ok {
+        already_certified: false,
+    })
+}
+
+/// Uploads slivers for an already-registered PooledBlob and certifies it.
+/// Safe to call repeatedly with backoff on failure — always checks on-chain
+/// certification state first, so a retry after a lost response won't
+/// double-certify.
+///
+/// config_json: {
+///   "walrus_config":          "/path/to/client_config.yaml",
+///   "storage_pool_object_id": "0x…",
+///   "pooled_blob_object_id":  "0x…",       ← from walrus_register_pooled_blob
+///   "blob_id":                "<base64url>",
+///   "encoding_type":          "RS2",       ← optional
+///   "private_key":            "<base64_std([0x00] || seed_32_bytes)>",
+///   "sui_address":            "0x…"
+/// }
+///
+/// Returns JSON: {"already_certified":bool} or {"error":"…"}
+/// MUST be freed with walrus_free_string().
+#[no_mangle]
+pub extern "C" fn walrus_upload_and_certify_pooled_blob(
+    config_json: *const c_char,
+    data_ptr: *const c_uchar,
+    data_len: usize,
+) -> *mut c_char {
+    let config_str = unsafe {
+        match CStr::from_ptr(config_json).to_str() {
+            Ok(s) => s,
+            Err(e) => return err_ptr(format!("invalid config UTF-8: {e}")),
+        }
+    };
+    let config: UploadCertifyPoolBlobConfig = match serde_json::from_str(config_str) {
+        Ok(c) => c,
+        Err(e) => return err_ptr(format!("config parse error: {e}")),
+    };
+    if data_ptr.is_null() && data_len > 0 {
+        return err_ptr("data_ptr is NULL but data_len > 0".to_string());
+    }
+    let data = if data_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(data_ptr, data_len) }.to_vec()
+    };
+
+    let result = match block_on(upload_and_certify_pooled_blob_async(config, data)) {
+        Ok(r) => r,
+        Err(e) => UploadCertifyPoolBlobResult::Err {
             error: format!("{e:#}"),
         },
     };

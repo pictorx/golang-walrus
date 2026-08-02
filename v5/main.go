@@ -1,14 +1,15 @@
 package main
 
 import (
-	// "context"
-
 	"context"
+	"crypto/rand"
 	"fmt"
-	"github.com/block-vision/sui-go-sdk/signer"
 	"log"
-	// "google.golang.org/grpc"
-	// "google.golang.org/grpc/credentials"
+	"time"
+
+	"github.com/block-vision/sui-go-sdk/signer"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 const (
@@ -28,25 +29,65 @@ func main() {
 
 	fmt.Println(storage_pool_objectID)*/
 
-	ctx := context.Background()
-
-	/*conn, err := grpc.Dial(TestnetConfig.GRPCEndpoint, grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
-	if err != nil {
-		log.Fatalf("Failed to dial: %v", err)
-	}
-	defer conn.Close()*/
-
-	/* randomSuffix := make([]byte, 8)
-	rand.Read(randomSuffix)
-	blobData := []byte(fmt.Sprintf("Hello, Walrus! Test at %x", randomSuffix))
-
-	blob, err := StoreBlobInPool(5, true, "0x15270e9746c8c4085d6b5d3915f5d26e605dc38136e94813a8d064c169bad5a2", blobData, acc)
+	storage_pool_objectID := "0x86e445d81c8a2921d4e93c029f402b2998c5cf439f74a17dad6b996c0c5e8415"
+	storage_status, err := GetStoragePoolStatus(storage_pool_objectID, acc)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(blob)*/
 
-	/*gasPrice, err := GetGas(conn, ctx)
+	ctx := context.Background()
+
+	current_epoch, err := getWalrusEpochTime(ctx, TestnetConfig.GraphQLEndpoint, TestnetConfig.WalrusStakingObject)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	conn, err := grpc.Dial(TestnetConfig.GRPCEndpoint, grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")))
+	if err != nil {
+		log.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	// If the storage_pool has expired create a new Storage pool
+	if uint32(current_epoch.Current) > uint32(storage_status.EndEpoch) {
+		storage_pool_objectID, err = CreateStoragePool(100, 5, acc)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		storage_status, err = GetStoragePoolStatus(storage_pool_objectID, acc)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	randomSuffix := make([]byte, 8)
+	rand.Read(randomSuffix)
+	blobData := []byte(fmt.Sprintf("Hello, Walrus! Test at %x", randomSuffix))
+
+	estimate, err := EstimateEncodedSize(uint64(len(blobData)), 1000, "RS2")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if storage_status.AvailableEncodedCapacityBytes < estimate.TotalEncodedSize {
+		err = IncreaseStoragePoolCapacity(storage_pool_objectID, estimate.TotalEncodedSize, acc)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	blob, err := StoreBlobInPoolSplit(
+		(uint32(storage_status.EndEpoch) - uint32(storage_status.StartEpoch)), true,
+		storage_pool_objectID, "RS2", blobData,
+		acc)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(blob)
+	time.Sleep(time.Second * 5)
+
+	gasPrice, err := GetGas(conn, ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -55,13 +96,14 @@ func main() {
 	add, err := AddPooledBlobMetadata(
 		conn,
 		TestnetConfig,
-		ctx, acc, "0x15270e9746c8c4085d6b5d3915f5d26e605dc38136e94813a8d064c169bad5a2",
-		BlobIDToBase64("80392606948090037230430042512468532838133279124717429954941529119024196032378"), "filename", "file.bin",
+		ctx, acc, storage_pool_objectID,
+		blob.BlobID, "filename", "file.bin",
 		100_000_000, *price,
 	)
 	if err != nil {
 		log.Fatal(err)
-	}*/
+	}
+	fmt.Println(add)
 
 	/*estimate, err := EstimateEncodedSize(39, 1000, "RS2")
 	if err != nil {
@@ -72,10 +114,12 @@ func main() {
 
 	pooledBlobs, err := GetStoragePoolBlobObjects(
 		ctx, TestnetConfig.GraphQLEndpoint,
-		"0x15270e9746c8c4085d6b5d3915f5d26e605dc38136e94813a8d064c169bad5a2")
+		storage_pool_objectID)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	fmt.Println(pooledBlobs)
 
 	//fmt.Println(pooledBlobs)
 
@@ -86,12 +130,12 @@ func main() {
 
 	fmt.Println(string(getPooledBlob))*/
 
-	var pooledBlobsId []string
+	/*var pooledBlobsId []string
 	for i := range pooledBlobs {
 		pooledBlobsId = append(pooledBlobsId, BlobIDToBase64(pooledBlobs[i]["blob_id"].(string)))
-	}
+	}*/
 
-	getPooledBlobs, err := ReadBlobs(pooledBlobsId, acc)
+	/*getPooledBlobs, err := ReadBlobs(pooledBlobsId, acc)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -100,6 +144,20 @@ func main() {
 		if b.Err == nil {
 			fmt.Println(string(b.Data))
 		}
+	}*/
+
+	/*storages, err := GetAllStoragePools(conn, ctx, acc, TestnetConfig)
+	if err != nil {
+		log.Fatal(err)
 	}
 
+	fmt.Println(storages)*/
+	storage_status, err = GetStoragePoolStatus(storage_pool_objectID, acc)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(storage_status.BlobCount)
+	fmt.Printf("storage used - %s\n", formatStoragePool(storage_status.UsedEncodedBytes))
+	fmt.Printf("storage available - %s\n", formatStoragePool(storage_status.AvailableEncodedCapacityBytes))
 }
